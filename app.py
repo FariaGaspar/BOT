@@ -14,9 +14,11 @@ from io import BytesIO
 
 # Caminhos absolutos para templates e static (funciona no Render e em qualquer diretório de trabalho)
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TEMPLATES_DIR = os.path.join(_BASE_DIR, 'templates')
+_STATIC_DIR = os.path.join(_BASE_DIR, 'static')
 app = Flask(__name__,
-    template_folder=os.path.join(_BASE_DIR, 'templates'),
-    static_folder=os.path.join(_BASE_DIR, 'static'),
+    template_folder=_TEMPLATES_DIR,
+    static_folder=_STATIC_DIR,
     static_url_path='/static')
 CORS(app)
 # Quando atrás de túnel (Cloudflare/ngrok), usar X-Forwarded-* para URLs e redirects corretos
@@ -152,33 +154,59 @@ def atualizar_sessao_ativa(request):
     
     return session_id
 
+def _html_erro_templates(exc):
+    """Resposta HTML quando um template não é encontrado (ex.: no Render sem pasta templates)."""
+    from flask import make_response
+    html = '''<!DOCTYPE html><html><head><meta charset="utf-8"><title>Erro</title></head><body style="font-family:sans-serif;padding:2rem;">
+    <h1>Ficheiros em falta no servidor</h1>
+    <p>O servidor não encontrou a pasta <strong>templates</strong> ou o ficheiro <strong>login.html</strong>.</p>
+    <p>Certifique-se de que no repositório GitHub (FariaGaspar/BOT) existem as pastas <strong>templates</strong> e <strong>static</strong> com todos os ficheiros.</p>
+    <p>Detalhe: %s</p>
+    <p>Caminho esperado para templates: %s</p>
+    </body></html>''' % (str(exc).replace('<', '&lt;'), _TEMPLATES_DIR)
+    r = make_response(html, 500)
+    r.headers['Content-Type'] = 'text/html; charset=utf-8'
+    return r
+
 @app.before_request
 def track_request():
     """Rastrear todas as requisições"""
     # Ignorar requisições para login, logout, túnel de teste, QR telemóvel, acesso remoto, estáticos e admin
-    if request.path in ['/login', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/tunnel-ok', '/qr', '/acesso-remoto'] or \
+    if request.path in ['/login', '/health', '/favicon.ico', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/tunnel-ok', '/qr', '/acesso-remoto'] or \
        request.path.startswith('/static/') or \
        request.path.startswith('/admin/'):
         return
     
     # Verificar autenticação para rotas protegidas (exceto login)
-    user = verificar_login()
+    try:
+        user = verificar_login()
+    except Exception:
+        user = None
     if not user:
         if request.path.startswith('/api/'):
             return jsonify({'error': 'Não autenticado', 'redirect': '/login'}), 401
         # Para páginas HTML, redirecionar para login
         if request.path == '/' or not request.path.startswith('/api/'):
-            return render_template('login.html')
+            try:
+                return render_template('login.html')
+            except Exception as te:
+                return _html_erro_templates(te)
         return jsonify({'error': 'Não autenticado', 'redirect': '/login'}), 401
     
     # Rastrear sessões ativas (apenas para rotas principais, não API)
     if not request.path.startswith('/api/'):
-        session_id = atualizar_sessao_ativa(request)
+        try:
+            session_id = atualizar_sessao_ativa(request)
+        except Exception:
+            session_id = obter_id_sessao()
         if session_id is None:
             # Sessão bloqueada - redirecionar para login
             if request.path.startswith('/api/'):
                 return jsonify({'error': 'Sessão bloqueada pelo administrador'}), 403
-            return render_template('login.html')
+            try:
+                return render_template('login.html')
+            except Exception as te:
+                return _html_erro_templates(te)
 
 @app.after_request
 def add_session_cookie(response):
@@ -1258,10 +1286,33 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+@app.route('/favicon.ico')
+def favicon():
+    """Evitar 500 quando o browser pede o ícone (não requer auth)."""
+    from flask import Response
+    return Response(status=204)
+
+@app.route('/health')
+def health():
+    """Verificar se a app está no ar (sem auth). Útil para Render e diagnóstico."""
+    import os as _os
+    t_dir = _os.path.join(_BASE_DIR, 'templates')
+    s_dir = _os.path.join(_BASE_DIR, 'static')
+    login_ok = _os.path.isfile(_os.path.join(t_dir, 'login.html'))
+    return jsonify({
+        'status': 'ok',
+        'templates_dir': t_dir,
+        'static_dir': s_dir,
+        'login_html_exists': login_ok,
+    }), 200
+
 @app.route('/login')
 def login_page():
     """Página de login"""
-    return render_template('login.html')
+    try:
+        return render_template('login.html')
+    except Exception as e:
+        return _html_erro_templates(e)
 
 @app.route('/api/utilizadores-login', methods=['GET'])
 def listar_utilizadores_login():
@@ -1459,8 +1510,14 @@ def index():
     """Página principal - requer login"""
     user = verificar_login()
     if not user:
-        return render_template('login.html')
-    return render_template('index.html', user=user)
+        try:
+            return render_template('login.html')
+        except Exception as e:
+            return _html_erro_templates(e)
+    try:
+        return render_template('index.html', user=user)
+    except Exception as e:
+        return _html_erro_templates(e)
 
 @app.route('/api/pedidos-pendentes', methods=['GET'])
 def get_pedidos_pendentes():
