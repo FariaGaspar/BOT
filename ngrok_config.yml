@@ -1,0 +1,6 @@
+version: "3"
+agent:
+  authtoken: "32Lktg7l95jBizmBgzGFKddz2Ni_44MszviK7Ks4LfLSMQ86f"
+  connect_cas: host
+  region: eu
+  proxy_url: ""

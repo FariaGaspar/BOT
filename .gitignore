@@ -1,0 +1,27 @@
+# Base de dados local (no Render criam nova)
+planeamento.db
+*.db
+
+# Uploads
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Ficheiros sensíveis / locais
+ngrok_token.txt
+usar_ngrok.txt
+ngrok_desativado.txt
+ips_bloqueados.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
