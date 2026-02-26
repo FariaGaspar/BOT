@@ -12,7 +12,12 @@ import csv
 import io
 from io import BytesIO
 
-app = Flask(__name__)
+# Caminhos absolutos para templates e static (funciona no Render e em qualquer diretório de trabalho)
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__,
+    template_folder=os.path.join(_BASE_DIR, 'templates'),
+    static_folder=os.path.join(_BASE_DIR, 'static'),
+    static_url_path='/static')
 CORS(app)
 # Quando atrás de túnel (Cloudflare/ngrok), usar X-Forwarded-* para URLs e redirects corretos
 try:
