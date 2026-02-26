@@ -12,10 +12,26 @@ import csv
 import io
 from io import BytesIO
 
-# Caminhos absolutos para templates e static (funciona no Render e em qualquer diretório de trabalho)
+# Caminhos absolutos para templates e static (Render + local). Se estiver em para_github, também procura na raiz.
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _TEMPLATES_DIR = os.path.join(_BASE_DIR, 'templates')
 _STATIC_DIR = os.path.join(_BASE_DIR, 'static')
+# Fallback: procurar templates em vários sítios (GitHub/Render pode ter raiz ou para_github)
+def _find_templates_static():
+    global _TEMPLATES_DIR, _STATIC_DIR
+    for try_dir, try_name in [
+        ((_BASE_DIR, 'para_github', 'templates'), (_BASE_DIR, 'para_github', 'static')),
+        ((_BASE_DIR, '..', 'templates'), (_BASE_DIR, '..', 'static')),
+    ]:
+        t = os.path.abspath(os.path.join(*try_dir))
+        s = os.path.abspath(os.path.join(*try_name))
+        if os.path.isdir(t) and os.path.isfile(os.path.join(t, 'login.html')):
+            _TEMPLATES_DIR = t
+            if os.path.isdir(s):
+                _STATIC_DIR = s
+            return
+if not os.path.isdir(_TEMPLATES_DIR) or not os.path.isfile(os.path.join(_TEMPLATES_DIR, 'login.html')):
+    _find_templates_static()
 app = Flask(__name__,
     template_folder=_TEMPLATES_DIR,
     static_folder=_STATIC_DIR,
