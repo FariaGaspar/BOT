@@ -2,6 +2,12 @@
 Servidor Web para Sistema de Planeamento de Cargas
 Migrado do Excel/VBA para Flask
 """
+# Carregar .env no PC para usar DATABASE_URL (PostgreSQL na nuvem)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from flask import Flask, render_template, request, jsonify, send_from_directory, send_file, make_response
 from flask_cors import CORS
 import sqlite3
@@ -37,14 +43,14 @@ app = Flask(__name__,
     static_folder=_STATIC_DIR,
     static_url_path='/static')
 CORS(app)
-# Quando atrás de túnel (Cloudflare/ngrok), usar X-Forwarded-* para URLs e redirects corretos
+# Se no futuro usar túnel externo, usar X-Forwarded-* para URLs e redirects corretos
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 except ImportError:
     pass
 
-# URL pública do túnel (ngrok/Cloudflare) — atualizada no arranque e na thread do Cloudflare
+# URL pública (túnel desativado — servidor só na rede local)
 app.config['URL_PUBLICA'] = None
 # IP Tailscale (para contornar rede corporativa) — definido no arranque
 app.config['TAILSCALE_IP'] = None
@@ -184,16 +190,39 @@ def _html_erro_templates(exc):
     r.headers['Content-Type'] = 'text/html; charset=utf-8'
     return r
 
+def _is_ip_rede_local():
+    """True se o pedido vem de outro dispositivo na rede (IP privado não localhost). Acesso livre sem login só para esses."""
+    ip = request.remote_addr or ''
+    if request.headers.get('X-Forwarded-For'):
+        ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    if not ip or ip == '127.0.0.1':
+        return False  # localhost = este PC = exige login
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        a, b, c, d = (int(x) for x in parts)
+        if a == 10: return True
+        if a == 172 and 16 <= b <= 31: return True
+        if a == 192 and b == 168: return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
 @app.before_request
 def track_request():
     """Rastrear todas as requisições"""
     # Ignorar requisições para login, logout, túnel de teste, QR telemóvel, acesso remoto, estáticos e admin
-    if request.path in ['/login', '/health', '/favicon.ico', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/tunnel-ok', '/qr', '/acesso-remoto'] or \
+    if request.path in ['/login', '/health', '/favicon.ico', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/tunnel-ok', '/qr', '/acesso-remoto', '/rede', '/teste-rede', '/acesso-fora', '/ips', '/ip-publico', '/solucao-manual', '/colocar-online'] or \
        request.path.startswith('/static/') or \
        request.path.startswith('/admin/'):
         return
     
-    # Verificar autenticação para rotas protegidas (exceto login)
+    # Acesso pela rede local (IP privado): qualquer pessoa pode entrar, sem login (como estava antes)
+    if _is_ip_rede_local():
+        return
+    
+    # Verificar autenticação para rotas protegidas (exceto login) — só para acesso que não é rede local
     try:
         user = verificar_login()
     except Exception:
@@ -242,11 +271,74 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, 'planeamento.db')
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 
+# Base de dados na nuvem (PostgreSQL): quando definido, PC e Render usam os mesmos dados
+DATABASE_URL = os.environ.get('DATABASE_URL')
+_using_pg = bool(DATABASE_URL)
+
 # Criar pasta de uploads se não existir
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+class _PGCursorWrapper:
+    """Cursor que aceita ? como placeholder (como SQLite) e expõe lastrowid para INSERT."""
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+    def execute(self, sql, params=()):
+        if params is None:
+            params = ()
+        sql_pg = sql.replace('?', '%s')
+        self._cursor.execute(sql_pg, params)
+        if sql.strip().upper().startswith('INSERT'):
+            try:
+                self._cursor.execute('SELECT lastval()')
+                self.lastrowid = self._cursor.fetchone()[0]
+            except Exception:
+                pass
+        return self
+    def executemany(self, sql, params_list):
+        sql_pg = sql.replace('?', '%s')
+        return self._cursor.executemany(sql_pg, params_list)
+    def _row_compat(self, r):
+        if not r or not hasattr(r, 'keys'):
+            return r
+        d = dict(r)
+        class _R(dict):
+            __getitem__ = lambda self, k: self['name'] if k == 1 and 'name' in self else dict.__getitem__(self, k)
+        return _R(d)
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return self._row_compat(row)
+    def fetchall(self):
+        return [self._row_compat(r) for r in self._cursor.fetchall()]
+    def close(self):
+        return self._cursor.close()
+
+class _PGConnWrapper:
+    def cursor(self):
+        try:
+            import psycopg2.extras
+            c = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        except Exception:
+            c = self._conn.cursor()
+        return _PGCursorWrapper(c)
+    def commit(self):
+        return self._conn.commit()
+    def close(self):
+        return self._conn.close()
+
 def get_db():
-    """Obter conexão com o banco de dados"""
+    """Obter conexão: PostgreSQL se DATABASE_URL estiver definido, senão SQLite local."""
+    if _using_pg:
+        try:
+            import psycopg2
+            # Render passa DATABASE_URL com postgres://; psycopg2 quer postgresql://
+            url = DATABASE_URL
+            if url.startswith('postgres://'):
+                url = 'postgresql://' + url[10:]
+            conn = psycopg2.connect(url)
+            return _PGConnWrapper(conn)
+        except Exception as e:
+            print(f'[AVISO] PostgreSQL falhou ({e}), a usar SQLite local.')
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -473,13 +565,34 @@ def verificar_data_anterior_e_codigo(data_operacao, codigo_fornecido=None):
         # Se não conseguir parsear a data, permitir (pode ser formato diferente)
         return True, None
 
+def _ddl_pg(sql):
+    """Converter DDL SQLite para PostgreSQL quando DATABASE_URL está definido."""
+    if not _using_pg or not isinstance(sql, str):
+        return sql
+    sql = sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
+    sql = sql.replace('AUTOINCREMENT', '')
+    return sql
+
 def init_db():
-    """Inicializar banco de dados com tabelas necessárias"""
+    """Inicializar banco de dados com tabelas necessárias (SQLite ou PostgreSQL)."""
+    import re
     conn = get_db()
     cursor = conn.cursor()
+    _execute = cursor.execute
+    def _exec(sql, params=()):
+        s = _ddl_pg(sql)
+        if _using_pg and 'PRAGMA table_info' in s:
+            m = re.search(r'PRAGMA table_info\((\w+)\)', s)
+            if m:
+                t = m.group(1)
+                s = f"SELECT (row_number() OVER (ORDER BY ordinal_position) - 1)::int AS cid, column_name AS name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '{t}'"
+        if params:
+            return _execute(s, params)
+        return _execute(s)
     
+
     # Tabela de Pedidos Pendentes (histórico completo - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS pedidos_pendentes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -495,13 +608,13 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_data ON pedidos_pendentes(data_entrega)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_cliente ON pedidos_pendentes(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_data ON pedidos_pendentes(data_entrega)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_cliente ON pedidos_pendentes(cliente)')
     except:
         pass
     
     # Tabela de Pedidos Entregues (histórico completo - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS pedidos_entregues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -517,13 +630,13 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_data ON pedidos_entregues(data_entrega)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_cliente ON pedidos_entregues(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_data ON pedidos_entregues(data_entrega)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_cliente ON pedidos_entregues(cliente)')
     except:
         pass
     
     # Tabela de Planeamento Diário (histórico completo por data - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS planeamento_diario (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_planeamento DATE NOT NULL,
@@ -542,48 +655,48 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_planeamento_data ON planeamento_diario(data_planeamento)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_planeamento_data ON planeamento_diario(data_planeamento)')
     except:
         pass
     
     # Garantir coluna observacoes nas tabelas de pedidos (migração leve)
-    cursor.execute("PRAGMA table_info(pedidos_pendentes)")
+    _exec("PRAGMA table_info(pedidos_pendentes)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN observacoes TEXT')
         except:
             pass
 
-    cursor.execute("PRAGMA table_info(pedidos_entregues)")
+    _exec("PRAGMA table_info(pedidos_entregues)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE pedidos_entregues ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE pedidos_entregues ADD COLUMN observacoes TEXT')
         except:
             pass
 
     # Coluna prioridade em pedidos_pendentes (para destacar em vermelho)
-    cursor.execute("PRAGMA table_info(pedidos_pendentes)")
+    _exec("PRAGMA table_info(pedidos_pendentes)")
     columns_pp = [row[1] for row in cursor.fetchall()]
     if 'prioridade' not in columns_pp:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN prioridade INTEGER DEFAULT 0')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN prioridade INTEGER DEFAULT 0')
             print("✅ Coluna 'prioridade' adicionada à tabela 'pedidos_pendentes'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'prioridade': {e}")
     # Coluna local_descarga em pedidos_pendentes e pedidos_entregues
     if 'local_descarga' not in columns_pp:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN local_descarga TEXT')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN local_descarga TEXT')
             print("✅ Coluna 'local_descarga' adicionada à tabela 'pedidos_pendentes'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'local_descarga': {e}")
-    cursor.execute("PRAGMA table_info(pedidos_entregues)")
+    _exec("PRAGMA table_info(pedidos_entregues)")
     columns_pe = [row[1] for row in cursor.fetchall()]
     if 'local_descarga' not in columns_pe:
         try:
-            cursor.execute('ALTER TABLE pedidos_entregues ADD COLUMN local_descarga TEXT')
+            _exec('ALTER TABLE pedidos_entregues ADD COLUMN local_descarga TEXT')
             print("✅ Coluna 'local_descarga' adicionada à tabela 'pedidos_entregues'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'local_descarga': {e}")
@@ -591,7 +704,7 @@ def init_db():
     # ========== NOVA ESTRUTURA: Motoristas, Tratores, Cisternas, Conjuntos ==========
     
     # Tabela de Motoristas
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS motoristas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -605,47 +718,47 @@ def init_db():
     ''')
     
     # Migração: Adicionar colunas se não existirem (para tabelas criadas antes)
-    cursor.execute("PRAGMA table_info(motoristas)")
+    _exec("PRAGMA table_info(motoristas)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'telefone' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN telefone TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN telefone TEXT')
             print("✅ Coluna 'telefone' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'telefone': {e}")
     
     if 'email' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN email TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN email TEXT')
             print("✅ Coluna 'email' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'email': {e}")
     
     if 'ativo' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN ativo BOOLEAN DEFAULT 1')
+            _exec('ALTER TABLE motoristas ADD COLUMN ativo BOOLEAN DEFAULT 1')
             print("✅ Coluna 'ativo' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'ativo': {e}")
     
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN observacoes TEXT')
             print("✅ Coluna 'observacoes' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'observacoes': {e}")
     
     if 'created_at' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            _exec('ALTER TABLE motoristas ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
             print("✅ Coluna 'created_at' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'created_at': {e}")
     
     if 'updated_at' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            _exec('ALTER TABLE motoristas ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
             print("✅ Coluna 'updated_at' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'updated_at': {e}")
@@ -659,13 +772,13 @@ def init_db():
     ]:
         if col_name not in columns:
             try:
-                cursor.execute(f'ALTER TABLE motoristas ADD COLUMN {col_name} {col_def}')
+                _exec(f'ALTER TABLE motoristas ADD COLUMN {col_name} {col_def}')
                 print(f"✅ Coluna '{col_name}' adicionada à tabela motoristas")
             except Exception as e:
                 print(f"⚠️ Erro ao adicionar coluna '{col_name}': {e}")
     
     # Tabela de Tratores
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS tratores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL UNIQUE,
@@ -681,7 +794,7 @@ def init_db():
     ''')
     
     # Tabela de Cisternas
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cisternas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL UNIQUE,
@@ -696,7 +809,7 @@ def init_db():
     ''')
     
     # Tabela de Conjuntos Habituais (Trator + Cisterna + Motorista)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS conjuntos_habituais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL,
@@ -716,7 +829,7 @@ def init_db():
     ''')
     
     # Tabela de Atribuições Diárias (Motorista atribuído a um conjunto numa data específica)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS atribuicoes_motoristas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conjunto_id INTEGER NOT NULL,
@@ -731,28 +844,44 @@ def init_db():
     ''')
     
     # Migração: Adicionar coluna data_desativacao se não existir
-    cursor.execute("PRAGMA table_info(conjuntos_habituais)")
+    _exec("PRAGMA table_info(conjuntos_habituais)")
     columns_conjuntos = [row[1] for row in cursor.fetchall()]
     
     if 'data_desativacao' not in columns_conjuntos:
         try:
-            cursor.execute('ALTER TABLE conjuntos_habituais ADD COLUMN data_desativacao DATE')
+            _exec('ALTER TABLE conjuntos_habituais ADD COLUMN data_desativacao DATE')
             print("✅ Coluna 'data_desativacao' adicionada à tabela 'conjuntos_habituais'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'data_desativacao' à tabela 'conjuntos_habituais': {e}")
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conjuntos_habituais_ordem ON conjuntos_habituais(ordem)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_data ON atribuicoes_motoristas(data_atribuicao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_conjunto ON atribuicoes_motoristas(conjunto_id, data_atribuicao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_conjuntos_habituais_ordem ON conjuntos_habituais(ordem)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_data ON atribuicoes_motoristas(data_atribuicao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_conjunto ON atribuicoes_motoristas(conjunto_id, data_atribuicao)')
     except:
         pass
+    
+    # Migração: colunas para avaria/alteracao de serviço no card
+    cursor.execute("PRAGMA table_info(atribuicoes_motoristas)")
+    cols_atrib = [row[1] for row in cursor.fetchall()]
+    if 'avaria_alteracao' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_alteracao INTEGER DEFAULT 0')
+            print("✅ Coluna 'avaria_alteracao' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_alteracao': {e}")
+    if 'avaria_observacao' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_observacao TEXT')
+            print("✅ Coluna 'avaria_observacao' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_observacao': {e}")
     
     # ========== SISTEMA DE AUTENTICAÇÃO E UTILIZADORES ==========
     
     # Tabela de Utilizadores do Sistema
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS utilizadores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -768,14 +897,14 @@ def init_db():
     ''')
     
     # Criar utilizador admin padrão se não existir
-    cursor.execute('SELECT COUNT(*) as count FROM utilizadores WHERE is_admin = 1')
+    _exec('SELECT COUNT(*) as count FROM utilizadores WHERE is_admin = 1')
     admin_exists = cursor.fetchone()['count'] > 0
     
     if not admin_exists:
         import hashlib
         # Password padrão: admin123 (deve ser alterada após primeiro login)
         password_hash = hashlib.sha256('admin123'.encode()).hexdigest()
-        cursor.execute('''
+        _exec('''
             INSERT INTO utilizadores (username, password_hash, nome, is_admin, ativo)
             VALUES (?, ?, ?, ?, ?)
         ''', ('admin', password_hash, 'Administrador', 1, 1))
@@ -784,7 +913,7 @@ def init_db():
     # ========== BASE DE DADOS DE CLIENTES E LOCAIS DE DESCARGA ==========
     
     # Tabela de Clientes e Locais de Descarga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS clientes_locais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -798,15 +927,15 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_clientes_locais_cliente ON clientes_locais(cliente)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_clientes_locais_ativo ON clientes_locais(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_clientes_locais_cliente ON clientes_locais(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_clientes_locais_ativo ON clientes_locais(ativo)')
     except:
         pass
     
     # ========== BASE DE DADOS DE LOCAIS DE CARGA ==========
     
     # Tabela de Locais de Carga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS locais_carga (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -819,14 +948,14 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_locais_carga_ativo ON locais_carga(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_locais_carga_ativo ON locais_carga(ativo)')
     except:
         pass
     
     # ========== BASE DE DADOS DE MATERIAIS ==========
     
     # Tabela de Materiais
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS materiais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -839,13 +968,13 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_materiais_nome ON materiais(nome)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_materiais_ativo ON materiais(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_materiais_nome ON materiais(nome)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_materiais_ativo ON materiais(ativo)')
     except:
         pass
     
     # Materiais que cada cliente/local de descarga recebe (vistos na BD de clientes)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cliente_local_materiais (
             cliente_local_id INTEGER NOT NULL,
             material_id INTEGER NOT NULL,
@@ -855,7 +984,7 @@ def init_db():
         )
     ''')
     # Materiais que cada local de carga carrega (vistos na BD de locais de carga)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS local_carga_materiais (
             local_carga_id INTEGER NOT NULL,
             material_id INTEGER NOT NULL,
@@ -865,7 +994,7 @@ def init_db():
         )
     ''')
     # Locais de carga associados a cada cliente/local de descarga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cliente_local_locais_carga (
             cliente_local_id INTEGER NOT NULL,
             local_carga_id INTEGER NOT NULL,
@@ -875,15 +1004,15 @@ def init_db():
         )
     ''')
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cliente_local_mat_cl ON cliente_local_materiais(cliente_local_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_carga_mat_lc ON local_carga_materiais(local_carga_id)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_cliente_local_mat_cl ON cliente_local_materiais(cliente_local_id)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_local_carga_mat_lc ON local_carga_materiais(local_carga_id)')
     except:
         pass
     
     # ========== BASE DE DADOS DE CONJUNTOS COMPATÍVEIS ==========
     
     # Tabela de Conjuntos Compatíveis (autorização para alterar matrículas)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS conjuntos_compatives (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trator_id INTEGER NOT NULL,
@@ -900,14 +1029,14 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conjuntos_compatives_autorizado ON conjuntos_compatives(autorizado)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_conjuntos_compatives_autorizado ON conjuntos_compatives(autorizado)')
     except:
         pass
     
     # ========== BASE DE DADOS DE TRANSPORTADORAS ==========
     
     # Tabela de Transportadoras
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS transportadoras (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -919,7 +1048,7 @@ def init_db():
     ''')
     
     # Tabela de Ativação de Transportadoras por Data
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS transportadoras_ativacao (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transportadora_id INTEGER NOT NULL,
@@ -933,9 +1062,9 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativo ON transportadoras(ativo)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_data ON transportadoras_ativacao(data_ativacao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_ativo ON transportadoras_ativacao(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativo ON transportadoras(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_data ON transportadoras_ativacao(data_ativacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_ativo ON transportadoras_ativacao(ativo)')
     except:
         pass
     
@@ -943,7 +1072,7 @@ def init_db():
     
     # ========== MANTER TABELA ANTIGA PARA COMPATIBILIDADE (migração gradual) ==========
     # Tabela de Viaturas e Motoristas (formato: PTSA | MATRÍCULA + CÓDIGO - NOME)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS viatura_motorista (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL,
@@ -958,51 +1087,51 @@ def init_db():
     ''')
     
     # Verificar e adicionar colunas temporárias se não existirem
-    cursor.execute("PRAGMA table_info(viatura_motorista)")
+    _exec("PRAGMA table_info(viatura_motorista)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'temporario' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN temporario BOOLEAN DEFAULT 0')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN temporario BOOLEAN DEFAULT 0')
         except:
             pass
     
     if 'data_temporaria' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN data_temporaria DATE')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN data_temporaria DATE')
         except:
             pass
     
     # Verificar e adicionar colunas de status se não existirem
-    cursor.execute("PRAGMA table_info(viatura_motorista)")
+    _exec("PRAGMA table_info(viatura_motorista)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'status' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN status TEXT')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN status TEXT')
         except:
             pass
     
     if 'observacao_status' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN observacao_status TEXT')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN observacao_status TEXT')
         except:
             pass
     
     if 'ordem' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN ordem INTEGER DEFAULT 0')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN ordem INTEGER DEFAULT 0')
         except:
             pass
     
     if 'data_desativacao' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN data_desativacao DATE')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN data_desativacao DATE')
         except:
             pass
     
     # Tabela de Associação Encomenda-ViaturaMotorista (histórico completo por data - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS encomenda_viatura (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pedido_id INTEGER NOT NULL,
@@ -1017,9 +1146,9 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_data ON encomenda_viatura(data_associacao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_pedido ON encomenda_viatura(pedido_id, pedido_tipo)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_viatura ON encomenda_viatura(viatura_motorista_id, data_associacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_data ON encomenda_viatura(data_associacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_pedido ON encomenda_viatura(pedido_id, pedido_tipo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_viatura ON encomenda_viatura(viatura_motorista_id, data_associacao)')
     except:
         pass
     
@@ -1139,9 +1268,24 @@ def init_db():
             descricao TEXT NOT NULL,
             dados_acao TEXT NOT NULL,
             data_acao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            revertido BOOLEAN DEFAULT 0
+            revertido BOOLEAN DEFAULT 0,
+            user_id INTEGER,
+            user_nome TEXT
         )
     ''')
+    # Garantir colunas de utilizador em historico_acoes (migração leve)
+    cursor.execute("PRAGMA table_info(historico_acoes)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'user_id' not in columns:
+        try:
+            cursor.execute('ALTER TABLE historico_acoes ADD COLUMN user_id INTEGER')
+        except:
+            pass
+    if 'user_nome' not in columns:
+        try:
+            cursor.execute('ALTER TABLE historico_acoes ADD COLUMN user_nome TEXT')
+        except:
+            pass
     
     # Tabela de matrículas temporárias (para troca de conjunto apenas da matrícula/código no dia)
     cursor.execute('''
@@ -1276,6 +1420,25 @@ def verificar_login():
     
     return None
 
+def registar_historico_acao(cursor, tipo_acao, descricao, dados_acao):
+    """
+    Registar ação no histórico incluindo o utilizador que a executou.
+    - cursor: cursor da base de dados já aberto
+    - tipo_acao: string
+    - descricao: string
+    - dados_acao: string JSON (já serializado)
+    """
+    try:
+        user = verificar_login()
+    except Exception:
+        user = None
+    user_id = user.get('id') if user else None
+    user_nome = (user.get('nome') or user.get('username')) if user else None
+    cursor.execute('''
+        INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao, user_id, user_nome)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (tipo_acao, descricao, dados_acao, user_id, user_nome))
+
 def login_required(f):
     """Decorator para proteger rotas que requerem login"""
     @wraps(f)
@@ -1333,28 +1496,36 @@ def login_page():
 @app.route('/api/utilizadores-login', methods=['GET'])
 def listar_utilizadores_login():
     """Listar utilizadores ativos para o dropdown de login (sem autenticação)"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, username, nome, is_admin
-        FROM utilizadores
-        WHERE ativo = 1
-        ORDER BY nome ASC
-    ''')
-    utilizadores = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    
-    # Converter booleanos
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, username, nome, is_admin
+            FROM utilizadores
+            WHERE ativo = 1
+            ORDER BY nome ASC
+        ''')
+        utilizadores = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+    except Exception:
+        try:
+            init_db()
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, username, nome, is_admin FROM utilizadores WHERE ativo = 1 ORDER BY nome ASC')
+            utilizadores = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+        except Exception:
+            utilizadores = []
     for u in utilizadores:
-        u['is_admin'] = bool(u['is_admin'])
-    
+        u['is_admin'] = bool(u.get('is_admin'))
     return jsonify(utilizadores)
 
 @app.route('/api/login', methods=['POST'])
 def login():
     """Autenticar utilizador"""
-    data = request.get_json()
-    username = data.get('username', '').strip()
+    data = request.get_json() or {}
+    username = (data.get('username') or '').strip()
     password = data.get('password', '')
     
     if not username or not password:
@@ -1362,6 +1533,17 @@ def login():
     
     conn = get_db()
     cursor = conn.cursor()
+    # Garantir que a tabela e o admin existem (ex.: primeiro deploy no Render)
+    try:
+        cursor.execute('SELECT COUNT(*) as c FROM utilizadores WHERE ativo = 1')
+        if cursor.fetchone()['c'] == 0:
+            init_db()
+            conn = get_db()
+            cursor = conn.cursor()
+    except Exception:
+        init_db()
+        conn = get_db()
+        cursor = conn.cursor()
     cursor.execute('SELECT * FROM utilizadores WHERE username = ? AND ativo = 1', (username,))
     user = cursor.fetchone()
     
@@ -1369,9 +1551,10 @@ def login():
         conn.close()
         return jsonify({'success': False, 'error': 'Credenciais inválidas'}), 401
     
-    # Verificar password
+    # Verificar password (comparar como string para evitar falhas de tipo)
     password_hash = hash_password(password)
-    if user['password_hash'] != password_hash:
+    stored_hash = (user['password_hash'] or '').strip()
+    if stored_hash != password_hash:
         conn.close()
         return jsonify({'success': False, 'error': 'Credenciais inválidas'}), 401
     
@@ -1407,7 +1590,17 @@ def logout():
 
 @app.route('/api/auth/check', methods=['GET'])
 def check_auth():
-    """Verificar se o utilizador está autenticado"""
+    """Verificar se o utilizador está autenticado. Rede local = considerado autenticado."""
+    if _is_ip_rede_local():
+        return jsonify({
+            'authenticated': True,
+            'user': {
+                'id': 0,
+                'username': 'Rede local',
+                'nome': 'Rede local',
+                'is_admin': False
+            }
+        })
     user = verificar_login()
     if user:
         return jsonify({
@@ -1423,9 +1616,302 @@ def check_auth():
 
 # ==================== ROTAS PRINCIPAIS ====================
 
+def _obter_ip_rede_local():
+    """Obtém um IP da máquina na rede local (método 8.8.8.8). Pode não ser o da Wi-Fi."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        pass
+    try:
+        return socket.gethostbyname(socket.gethostname()) or '127.0.0.1'
+    except Exception:
+        return '127.0.0.1'
+
+def _obter_todos_ips_locais():
+    """Lista todos os IPv4 do PC (Wi-Fi, Ethernet, etc.) para tentar no outro PC."""
+    import socket
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for res in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = res[4][0]
+            if ip and ip != '127.0.0.1' and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    if not ips:
+        ip_principal = _obter_ip_rede_local()
+        if ip_principal and ip_principal != '127.0.0.1':
+            ips.append(ip_principal)
+    return ips if ips else ['127.0.0.1']
+
+@app.route('/teste-rede')
+def teste_rede():
+    """Teste mínimo: se o outro PC abrir isto, a rede e a firewall estão OK. Sem login."""
+    client_ip = request.remote_addr or '?'
+    return f'OK - servidor a responder. O teu IP e: {client_ip}', 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+@app.route('/ips')
+def rota_ips():
+    """JSON com todos os IPs deste PC para diagnóstico. Sem login."""
+    todos = _obter_todos_ips_locais()
+    ips_rede = [ip for ip in todos if ip != '127.0.0.1']
+    tailscale_ip = app.config.get('TAILSCALE_IP')
+    return jsonify({'ips': ips_rede or [], 'tailscale': tailscale_ip, 'url_tailscale': f'http://{tailscale_ip}:8080' if tailscale_ip else None})
+
+@app.route('/ip-publico')
+def ip_publico():
+    """Mostra o IP público (para usar com encaminhamento de portas). Sem login, sem instalar nada."""
+    import urllib.request
+    ip_publico_val = None
+    for url in ['https://api.ipify.org', 'https://icanhazip.com', 'https://ifconfig.me/ip']:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                ip_publico_val = r.read().decode().strip()
+                if ip_publico_val and len(ip_publico_val) < 50:
+                    break
+        except Exception:
+            continue
+    from flask import render_template_string
+    ip_local_principal = next((ip for ip in _obter_todos_ips_locais() if ip != '127.0.0.1'), '192.168.x.x')
+    html = '''<!DOCTYPE html>
+<html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IP público — encaminhamento de portas</title>
+<style>
+body{font-family:sans-serif;max-width:560px;margin:2rem auto;padding:0 1rem;}
+h1{color:#333;}
+.url{background:#eee;padding:1rem;border-radius:8px;font-size:1.2rem;word-break:break-all;margin:1rem 0;}
+.ok{background:#e8f5e9;border-left:4px solid #2e7d32;padding:0.8rem 1rem;margin:1rem 0;}
+.passo{background:#fff8e6;border-left:4px solid #e6a800;padding:0.8rem 1rem;margin:1rem 0;}
+ol{line-height:1.9;} code{background:#f5f5f5;padding:2px 6px;}
+a{color:#1565c0;}
+</style></head><body>
+<h1>🌐 Aceder de fora (sem instalar nada)</h1>
+<p>Usando <strong>encaminhamento de portas no router</strong> — não precisa de programas nem de permissões de administrador no PC.</p>
+''' + (f'<div class="url"><strong>O teu IP público é:</strong> {ip_publico_val}<br>De fora da rede, abre: <a href="http://{ip_publico_val}:8080" target="_blank">http://{ip_publico_val}:8080</a></div>' if ip_publico_val else '<div class="passo">Não foi possível obter o IP público (rede/proxy?). Tenta mais tarde ou vê no router.</div>') + '''
+<div class="ok"><h2>Passos no router</h2>
+<ol>
+<li>Abre o <strong>router</strong> no browser (geralmente <code>192.168.0.1</code> ou <code>192.168.1.1</code>).</li>
+<li>Entra com a password do router (a da Wi‑Fi ou a que está na etiqueta).</li>
+<li>Procura <strong>Port Forwarding</strong> / <strong>Encaminhamento de portas</strong> / <strong>NAT</strong> / <strong>Virtual Server</strong>.</li>
+<li>Cria uma regra: porta externa <code>8080</code>, IP interno <code>''' + ip_local_principal + '''</code>, porta interna <code>8080</code>, protocolo TCP (ou ambos).</li>
+<li>Guarda. De outro sítio (dados móveis, outro Wi‑Fi), abre no browser o link acima (http://[IP-público]:8080).</li>
+</ol>
+<p><em>O IP interno deste PC pode ser outro; vê em <a href="/ips">/ips</a>. Se o IP público mudar (ISP), terás de usar o novo.</em></p></div>
+<p><a href="/rede">← Voltar a Abrir na rede</a></p>
+</body></html>'''
+    return render_template_string(html)
+
+@app.route('/rede')
+def pagina_rede():
+    """Página com o URL e passos para abrir no telemóvel/outro PC. Opção sem instalar nada: encaminhamento de portas."""
+    from flask import render_template_string
+    todos_ips = _obter_todos_ips_locais()
+    ips_ordenados = sorted(todos_ips, key=lambda x: (0 if x.startswith('192.168.') else 1, x))
+    listagem_urls = ' | '.join(f'http://{ip}:8080' for ip in ips_ordenados if ip != '127.0.0.1') or 'http://[IP_DESTE_PC]:8080'
+    ip_principal = next((ip for ip in ips_ordenados if ip != '127.0.0.1'), '192.168.x.x')
+    secao_fora = '''
+<div class="ok"><h2>🌐 Aceder de fora (sem instalar nada, sem administrador)</h2>
+<p>Se a rede local não funcionar ou quiseres aceder de outro sítio (dados móveis, outro Wi‑Fi), usa <strong>encaminhamento de portas no router</strong>. Não precisas de instalar programas nem de permissões de administrador no PC.</p>
+<ol>
+<li>No router (browser em 192.168.0.1 ou 192.168.1.1), cria uma regra: porta 8080 → IP deste PC (''' + ip_principal + ''') porta 8080.</li>
+<li>Vê o teu <strong>IP público</strong> e o link para usar de fora: <a href="/ip-publico">Abrir página IP público e instruções</a>.</li>
+</ol>
+<p><a href="/ip-publico">→ IP público e passos no router</a></p></div>
+<p><strong>Se nada disto funcionar:</strong> <a href="/solucao-manual">Outras soluções</a> (um comando, um ficheiro, ou partilha de ecrã).</p>'''
+    html = '''<!DOCTYPE html>
+<html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Abrir na rede</title>
+<style>
+body { font-family: sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+h1,h2 { color: #333; }
+.url { background: #eee; padding: 1rem; border-radius: 8px; font-size: 1.1rem; word-break: break-all; margin: 0.6rem 0; }
+.url a { display: block; margin: 0.3rem 0; }
+.passo { background: #fff8e6; border-left: 4px solid #e6a800; padding: 0.8rem 1rem; margin: 1rem 0; }
+.erro { background: #ffebee; border-left: 4px solid #c62828; padding: 0.8rem 1rem; margin: 1rem 0; }
+.ok { background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 0.8rem 1rem; margin: 1rem 0; }
+a { color: #1565c0; }
+ol { line-height: 1.8; }
+code { background: #f5f5f5; padding: 2px 6px; }
+</style>
+</head><body>
+<h1>📱 Abrir no telemóvel ou noutro PC</h1>
+<h2>Opção 1 — Mesma Wi‑Fi</h2>
+<p><strong>Teste:</strong> no outro dispositivo, abre um destes. Se aparecer "OK - servidor a responder", a rede está OK.</p>
+<div class="url">''' + (''.join(f'<a href="http://{ip}:8080/teste-rede" target="_blank">http://{ip}:8080/teste-rede</a><br>' for ip in ips_ordenados if ip != '127.0.0.1') or '(nenhum IP de rede encontrado)') + '''</div>
+<p><strong>Aplicação:</strong> ''' + listagem_urls + '''</p>
+<div class="passo"><strong>Se não abrir:</strong> execute <code>PERMITIR_PORTA_8080_FIREWALL.bat</code> como Administrador; tente cada IP acima; desative temporariamente antivírus/firewall de terceiros.</div>
+<div class="erro">Se mesmo assim não abrir: o router pode ter "isolamento de clientes". Use a <strong>Opção 2 (encaminhamento de portas)</strong> abaixo para aceder de fora.</div>
+''' + secao_fora + '''
+<p style="margin-top:1.5rem;"><strong>✅ Solução que funciona:</strong> <a href="/colocar-online">Colocar a aplicação online</a> (Render ou PythonAnywhere, grátis) — fica um link que abre em todo o lado, sem túneis nem firewall.</p>
+<p><a href="/solucao-manual">Outras soluções (comando SSH, ficheiro cloudflared, partilha ecrã)</a></p>
+<p><a href="/">Voltar à aplicação</a> · <a href="/ips">Ver IPs (JSON)</a></p>
+</body></html>'''
+    return render_template_string(html)
+
+@app.route('/solucao-manual')
+def solucao_manual():
+    """Outras formas de aceder: um comando (SSH), um ficheiro (cloudflared), ou partilha de ecrã. Sem login."""
+    from flask import render_template_string
+    html = '''<!DOCTYPE html>
+<html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Outras soluções</title>
+<style>
+body{font-family:sans-serif;max-width:620px;margin:2rem auto;padding:0 1rem;}
+h1,h2{color:#333;}
+.box{background:#f5f5f5;border-radius:8px;padding:1rem 1.2rem;margin:1rem 0;border-left:4px solid #1565c0;}
+.box h2{margin-top:0;}
+code{background:#fff;padding:2px 6px;border:1px solid #ddd;display:block;margin:0.5rem 0;word-break:break-all;font-size:0.95rem;}
+.copy{background:#e3f2fd;padding:0.5rem;border-radius:4px;}
+a{color:#1565c0;}
+ol{line-height:1.9;}
+ul{line-height:1.7;}
+</style></head><body>
+<h1>🔧 Outras soluções (sem instalar com administrador)</h1>
+<p>Se a rede local e o encaminhamento de portas não funcionarem, experimenta uma destas.</p>
+
+<div class="box">
+<h2>1. Um comando (SSH)</h2>
+<p>Se o teu Windows tiver <strong>OpenSSH</strong> (Windows 10/11 costuma ter):</p>
+<ol>
+<li>Abre <strong>PowerShell</strong> ou <strong>CMD</strong> (não precisa de administrador).</li>
+<li>Copia e cola este comando (com o servidor desta aplicação a correr):</li>
+</ol>
+<code class="copy">ssh -o BatchMode=yes -o StrictHostKeyChecking=no -R 80:localhost:8080 nokey@localhost.run</code>
+<p>Aparecerá um link do tipo <code>https://xxxx.localhost.run</code>. Abre esse link no telemóvel ou noutro PC. Não feches a janela do PowerShell.</p>
+<p><em>Se der erro "ssh não é reconhecido": em Definições → Aplicações → Funcionalidades opcionais → adicionar "Cliente OpenSSH" (pode precisar de admin). Se não puderes, usa a opção 2.</em></p>
+</div>
+
+<div class="box">
+<h2>2. Um ficheiro (Cloudflare Tunnel)</h2>
+<p>Não é "instalação" — só descarregar um zip e executar o ficheiro dessa pasta.</p>
+<ol>
+<li>Descarrega: <a href="https://github.com/cloudflare/cloudflared/releases/latest" target="_blank">cloudflared para Windows (zip)</a> — na página, escolhe o ficheiro <code>cloudflared-windows-amd64.zip</code> (ou 386 se for PC antigo).</li>
+<li>Extrai o zip para uma pasta (ex. Ambiente de trabalho ou Documentos). Fica um ficheiro <code>cloudflared.exe</code>.</li>
+<li>Com o servidor desta aplicação a correr, abre <strong>CMD</strong> ou PowerShell, vai a essa pasta (ex. <code>cd Desktop</code>) e executa:</li>
+</ol>
+<code class="copy">cloudflared.exe tunnel --url http://localhost:8080</code>
+<p>Aparecerá um link <code>https://xxxx.trycloudflare.com</code>. Abre no telemóvel/outro PC. Não feches a janela.</p>
+</div>
+
+<div class="box">
+<h2>3. Partilha de ecrã (último recurso)</h2>
+<p>Se nada der link direto para a aplicação, a outra pessoa pode <strong>ver o teu ecrã</strong> enquanto usas a aplicação:</p>
+<ul>
+<li><strong>Google Chrome Remote Desktop</strong> — no Chrome, pesquisa "Chrome Remote Desktop"; partilha este PC; a outra pessoa acede com conta Google.</li>
+<li><strong>join.me</strong> ou <strong>TeamViewer</strong> — descarregam um pequeno programa; partilhas o ecrã; a outra pessoa vê o browser com a aplicação.</li>
+</ul>
+<p>Assim não acedem à aplicação diretamente, mas conseguem ver e usar contigo.</p>
+</div>
+
+<p><a href="/rede">← Voltar a Abrir na rede</a> · <a href="/colocar-online">Solução: colocar online</a></p>
+</body></html>'''
+    return render_template_string(html)
+
+@app.route('/colocar-online')
+def colocar_online():
+    """Várias opções para colocar a aplicação online. Link acessível em todo o lado."""
+    from flask import render_template_string
+    html = '''<!DOCTYPE html>
+<html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colocar aplicação online</title>
+<style>
+body{font-family:sans-serif;max-width:680px;margin:2rem auto;padding:0 1.2rem;}
+h1{color:#0d47a1;}
+.hero{background:linear-gradient(135deg,#e3f2fd 0%,#bbdefb 100%);border-radius:12px;padding:1.5rem;margin:1.5rem 0;border-left:4px solid #1565c0;}
+.step{background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:1rem 1.2rem;margin:1rem 0;}
+.step h3{margin-top:0;color:#333;}
+.step.destaque{border-color:#2e7d32;background:#f1f8e9;}
+ol,ul{line-height:1.9;}
+a{color:#1565c0;}
+code{background:#f5f5f5;padding:2px 6px;font-size:0.9em;}
+.nav-links{margin-top:1.5rem;}
+</style></head><body>
+<h1>✅ Colocar a aplicação online</h1>
+<div class="hero">
+<p>Várias opções gratuitas. Escolha uma; se uma falhar (bloqueio, região, etc.), experimente outra. Todas dão um <strong>link que abre em todo o lado</strong>.</p>
+</div>
+
+<div class="step destaque">
+<h3>1. Replit — sem GitHub, muito simples</h3>
+<ol>
+<li>Abra <a href="https://replit.com" target="_blank">replit.com</a>, crie conta (Google ou email).</li>
+<li>Clique <strong>Create Repl</strong> → escolha <strong>Python</strong> → nome (ex. planeamento).</li>
+<li>Na pasta do Repl: faça upload de <code>app.py</code> e <code>requirements.txt</code> (arrastar para a janela ou use os 3 pontos → Upload file).</li>
+<li>No ficheiro <code>main.py</code> ou crie um com: <code>from app import app</code> e <code>app.run(host="0.0.0.0", port=8080)</code> — ou no Replit use "Run" e depois <strong>Webview</strong> / "Open in new tab"; o Replit mostra o URL (ex. <code>https://nome-do-repl.seuuser.repl.co</code>).</li>
+<li>Se o Replit pedir estrutura: deixe <code>app.py</code> na raiz, em <code>main.py</code> ponha apenas <code>from app import app</code> e nas definições do Repl defina "Run" como <code>python main.py</code> ou <code>gunicorn app:app --bind 0.0.0.0:8080</code>.</li>
+</ol>
+<p><em>Vantagem: não precisa de GitHub. Pode copiar/colar ficheiros.</em></p>
+</div>
+
+<div class="step">
+<h3>2. Render</h3>
+<ol>
+<li><a href="https://render.com" target="_blank">render.com</a> → conta (GitHub ou email).</li>
+<li><strong>New → Web Service</strong> → ligue o repositório GitHub (ou crie um com app.py + requirements.txt).</li>
+<li>Build: <code>pip install -r requirements.txt</code>. Start: <code>gunicorn app:app --bind 0.0.0.0:$PORT</code>.</li>
+<li>URL: <code>https://seu-app.onrender.com</code>.</li>
+</ol>
+</div>
+
+<div class="step">
+<h3>3. Railway</h3>
+<ol>
+<li><a href="https://railway.app" target="_blank">railway.app</a> → Login with GitHub.</li>
+<li><strong>New Project</strong> → Deploy from GitHub repo (ou "Empty Project" e depois configure).</li>
+<li>Adicione o repositório; Railway detecta Python. Build: <code>pip install -r requirements.txt</code>; Start: <code>gunicorn app:app --bind 0.0.0.0:$PORT</code>.</li>
+<li>Gera um URL público (ex. <code>https://xxx.up.railway.app</code>).</li>
+</ol>
+</div>
+
+<div class="step">
+<h3>4. Fly.io</h3>
+<ol>
+<li>Instale o CLI: <a href="https://fly.io/docs/hands-on/install-flyctl/" target="_blank">fly.io/docs — install flyctl</a> (uma linha no PowerShell).</li>
+<li>Na pasta do projeto: <code>fly launch</code> (cria app); depois <code>fly deploy</code>.</li>
+<li>Precisa de um <code>Dockerfile</code> ou Fly usa buildpack. Exemplo Dockerfile na pasta: <code>FROM python:3.11-slim</code>, <code>WORKDIR /app</code>, <code>COPY requirements.txt</code>, <code>RUN pip install -r requirements.txt</code>, <code>COPY .</code>, <code>CMD ["gunicorn","app:app","--bind","0.0.0.0:8080"]</code>.</li>
+<li>URL: <code>https://seu-app.fly.dev</code>.</li>
+</ol>
+</div>
+
+<div class="step">
+<h3>5. PythonAnywhere</h3>
+<ol>
+<li><a href="https://www.pythonanywhere.com" target="_blank">pythonanywhere.com</a> → conta gratuita.</li>
+<li>Dashboard → <strong>Web</strong> → Add new web app (Flask).</li>
+<li>Upload de <code>app.py</code> e dependências (ou Git clone). Configurar WSGI: <code>from app import app</code>.</li>
+<li>URL: <code>https://seuuser.pythonanywhere.com</code>.</li>
+</ol>
+</div>
+
+<div class="step">
+<h3>6. Koyeb</h3>
+<ol>
+<li><a href="https://www.koyeb.com" target="_blank">koyeb.com</a> → sign up (GitHub).</li>
+<li><strong>Create App</strong> → Deploy from GitHub; escolha o repo. Build: <code>pip install -r requirements.txt</code>; Run: <code>gunicorn app:app --bind 0.0.0.0:$PORT</code>.</li>
+<li>URL tipo <code>https://seu-app.koyeb.app</code>.</li>
+</ol>
+</div>
+
+<div class="step">
+<h3>O que levar em todas</h3>
+<p><code>app.py</code> + <code>requirements.txt</code> (Flask, gunicorn, openpyxl, etc.). A app já usa a variável <code>PORT</code> quando existe.</p>
+</div>
+
+<p class="nav-links"><a href="/rede">← Abrir na rede</a></p>
+</body></html>'''
+    return render_template_string(html)
+
 @app.route('/tunnel-ok')
 def tunnel_ok():
-    """Rota de teste para verificar se o túnel Cloudflare/ngrok chega à aplicação (sem login)."""
+    """Rota de teste para verificar se a aplicação responde (sem login)."""
     return 'OK - túnel a funcionar', 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
 
@@ -1523,7 +2009,12 @@ def acesso_remoto():
 
 @app.route('/')
 def index():
-    """Página principal - requer login"""
+    """Página principal. Rede local: acesso livre. Outros: requer login."""
+    if _is_ip_rede_local():
+        try:
+            return render_template('index.html', user={'id': 0, 'username': 'Rede local', 'admin': False})
+        except Exception as e:
+            return _html_erro_templates(e)
     user = verificar_login()
     if not user:
         try:
@@ -2324,10 +2815,8 @@ def atualizar_pendente():
             
             # Registar ação no histórico se for alteração de data
             if field == 'data_entrega':
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'ALTERAR_DATA_PEDIDO',
                     f'Alterar data de entrega: {pedido_antigo_dict.get("cliente", "")} - {valor_antigo} → {value}',
                     json.dumps({
@@ -2339,7 +2828,7 @@ def atualizar_pendente():
                         'data_antiga': valor_antigo,
                         'data_nova': value
                     })
-                ))
+                )
         
         conn.commit()
         conn.close()
@@ -2400,10 +2889,8 @@ def atualizar_entregue():
             
             # Registar ação no histórico se for alteração de data
             if field == 'data_entrega':
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'ALTERAR_DATA_PEDIDO',
                     f'Alterar data de entrega: {pedido_antigo_dict.get("cliente", "")} - {valor_antigo} → {value}',
                     json.dumps({
@@ -2415,7 +2902,7 @@ def atualizar_entregue():
                         'data_antiga': valor_antigo,
                         'data_nova': value
                     })
-                ))
+                )
         
         conn.commit()
         conn.close()
@@ -2484,10 +2971,8 @@ def remover_pedido():
         cursor.execute(f'DELETE FROM {tabela} WHERE id = ?', (pedido_id,))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'REMOVER_PEDIDO',
             f'Remover pedido {tipo}: {pedido["cliente"]} - {pedido.get("local_carga", "")} - {pedido.get("material", "")}',
             json.dumps({
@@ -2500,7 +2985,7 @@ def remover_pedido():
                 'observacoes': pedido.get('observacoes', ''),
                 'atribuicoes': [{'viatura_motorista_id': a[3], 'data_associacao': a[4], 'nome_motorista': a[6], 'matricula': a[7]} for a in atribuicoes] if atribuicoes else []
             })
-        ))
+        )
     
     conn.commit()
     conn.close()
@@ -2943,10 +3428,8 @@ def apagar_viatura_motorista_permanente(vm_id):
         ''', (data_atual, vm_id))
         
         # Registar ação no histórico com TODOS os dados necessários para reverter
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'APAGAR_CARD_PERMANENTE',
             f'Apagar card permanentemente a partir de {data_atual}: {motorista[2]} ({motorista[1]})',
             json.dumps({
@@ -2965,7 +3448,7 @@ def apagar_viatura_motorista_permanente(vm_id):
                 'matriculas_detalhadas_removidas': matriculas_detalhadas_dados,
                 'observacoes_temp_removidas': observacoes_dados
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3031,10 +3514,8 @@ def alterar_matricula_viatura(vm_id):
         descricao_completa = " + ".join(descricao_matriculas) if descricao_matriculas else "Nenhuma"
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'ALTERAR_MATRICULA',
             f'Alterar matrícula (dia {data_associacao}): {motorista[2]} - {descricao_completa}',
             json.dumps({
@@ -3045,7 +3526,7 @@ def alterar_matricula_viatura(vm_id):
                 'data_associacao': data_associacao,
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3281,10 +3762,8 @@ def atualizar_status_viatura_motorista(vm_id):
                 if data_inicio_anterior and data_fim_anterior:
                     descricao += f' (período: {data_inicio_anterior} a {data_fim_anterior})'
                 
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'DISPONIBILIDADE_FORCADA',
                     descricao,
                     json.dumps({
@@ -3297,7 +3776,7 @@ def atualizar_status_viatura_motorista(vm_id):
                         'data_inicio_anterior': data_inicio_anterior,
                         'data_fim_anterior': data_fim_anterior
                     })
-                ))
+                )
                 conn.commit()
                 print(f"DEBUG - Disponibilidade forçada registada: {descricao}")
         
@@ -3312,13 +3791,7 @@ def atualizar_status_viatura_motorista(vm_id):
                     conn.close()
                 return jsonify({'success': False, 'error': f'Data inválida: {str(e)}'}), 400
             
-            # Remover status antigos do mesmo tipo para este motorista
-            cursor.execute('''
-                DELETE FROM viatura_motorista_status 
-                WHERE viatura_motorista_id = ? AND status = ?
-            ''', (viatura_motorista_id, status))
-            
-            # Criar registos para cada dia útil do período
+            # Criar registos para cada dia útil do período (sem apagar registos anteriores)
             data_atual = data_inicio_obj
             while data_atual <= data_fim_obj:
                 # Só criar para dias úteis (segunda a sexta)
@@ -3447,10 +3920,8 @@ def remover_viatura_motorista(vm_id):
         ''', (data_atual, vm_id))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'DESATIVAR_CARD_DATA_ATUAL',
             f'Desativar card a partir de {data_atual}: {motorista[2]} ({motorista[1]})',
             json.dumps({
@@ -3460,7 +3931,7 @@ def remover_viatura_motorista(vm_id):
                 'matricula': motorista[1],
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3839,10 +4310,8 @@ def atribuir_encomenda():
             ''', (pedido_id, pedido_tipo, vm_id_para_insert, data_associacao, proxima_ordem))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'ATRIBUIR_ENCOMENDA',
             f'Atribuir encomenda a {motorista[0]} ({motorista[1]}): {pedido.get("cliente", "")} - {pedido.get("local_carga", "")} - {pedido.get("material", "")}',
             json.dumps({
@@ -3857,7 +4326,7 @@ def atribuir_encomenda():
                 'nome_motorista': motorista[0],
                 'matricula': motorista[1]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3912,10 +4381,8 @@ def remover_atribuicao(atribuicao_id):
         cursor.execute('DELETE FROM encomenda_viatura WHERE id = ?', (atribuicao_id,))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'REMOVER_ATRIBUICAO',
             f'Remover atribuição de encomenda: {cliente} - {local_carga} - {material} de {nome_motorista} ({matricula})',
             json.dumps({
@@ -3932,7 +4399,7 @@ def remover_atribuicao(atribuicao_id):
                 'nome_motorista': nome_motorista,
                 'matricula': matricula
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3985,10 +4452,8 @@ def remover_atribuicao_por_pedido():
         if atribuicao and pedido:
             atribuicao_dict = dict(atribuicao) if atribuicao else {}
             pedido_dict = dict(pedido) if pedido else {}
-            cursor.execute('''
-                INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                VALUES (?, ?, ?)
-            ''', (
+            registar_historico_acao(
+                cursor,
                 'REMOVER_ATRIBUICAO',
                 f'Remover atribuição de encomenda: {pedido_dict.get("cliente", "")} - {pedido_dict.get("local_carga", "")} - {pedido_dict.get("material", "")} de {atribuicao_dict.get("nome_motorista", "")} ({atribuicao_dict.get("matricula", "")})',
                 json.dumps({
@@ -4004,7 +4469,7 @@ def remover_atribuicao_por_pedido():
                     'nome_motorista': atribuicao_dict.get('nome_motorista', ''),
                     'matricula': atribuicao_dict.get('matricula', '')
                 })
-            ))
+            )
         
         conn.commit()
         conn.close()
@@ -4096,10 +4561,8 @@ def mover_encomenda_motorista():
             atribuicao_antiga_dict = dict(atribuicao_antiga) if atribuicao_antiga else {}
             motorista_novo_dict = dict(motorista_novo) if motorista_novo else {}
             
-            cursor.execute('''
-                INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                VALUES (?, ?, ?)
-            ''', (
+            registar_historico_acao(
+                cursor,
                 'MOVER_ENCOMENDA',
                 f'Mover encomenda: {pedido_dict.get("cliente", "")} - {atribuicao_antiga_dict.get("nome_motorista", "")} ({atribuicao_antiga_dict.get("matricula", "")}) → {motorista_novo_dict.get("nome_motorista", "")} ({motorista_novo_dict.get("matricula", "")})',
                 json.dumps({
@@ -4118,7 +4581,7 @@ def mover_encomenda_motorista():
                     'motorista_destino': motorista_novo_dict.get('nome_motorista', ''),
                     'matricula_destino': motorista_novo_dict.get('matricula', '')
                 })
-            ))
+            )
         
         conn.commit()
         conn.close()
@@ -4234,10 +4697,8 @@ def apagar_card_dia():
             card_desativado = False
         
         # Registar ação no histórico (antes do commit)
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'APAGAR_CARD_DIA',
             f'Apagar card do dia: {motorista[2]} ({motorista[1]}) - {data_associacao}',
             json.dumps({
@@ -4247,7 +4708,7 @@ def apagar_card_dia():
                 'matricula': motorista[1],
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -4347,20 +4808,21 @@ def exportar_wialong():
         cursor = conn.cursor()
         
         # Buscar todas as viaturas com encomendas atribuídas para a data
+        # Sequência para Wialong: Local de descarga - Local de carga - Material
         cursor.execute('''
             SELECT 
                 vm.id as viatura_motorista_id,
                 vm.matricula,
                 vm.codigo,
                 vm.nome_motorista,
-                pp.cliente,
+                COALESCE(pp.local_descarga, pp.cliente, '') as local_descarga,
                 pp.local_carga,
                 pp.material
             FROM encomenda_viatura ev
             INNER JOIN viatura_motorista vm ON ev.viatura_motorista_id = vm.id
             INNER JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
             WHERE ev.data_associacao = ?
-            ORDER BY vm.matricula ASC, pp.cliente ASC
+            ORDER BY vm.matricula ASC, pp.local_descarga ASC
         ''', (data_planeamento,))
         
         dados_raw = cursor.fetchall()
@@ -4687,7 +5149,8 @@ def get_historico_entregas():
                 vm.matricula || ' + ' || vm.codigo || ' - ' || vm.nome_motorista as viatura_motorista,
                 COALESCE(pp.cliente, pe.cliente, '') as cliente,
                 COALESCE(pp.local_carga, pe.local_carga, '') as local_carga,
-                COALESCE(pp.material, pe.material, '') as material
+                COALESCE(pp.material, pe.material, '') as material,
+                COALESCE(pp.observacoes, pe.observacoes, '') as observacoes
             FROM encomenda_viatura ev
             INNER JOIN viatura_motorista vm ON ev.viatura_motorista_id = vm.id
             LEFT JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
@@ -4760,7 +5223,8 @@ def get_historico_entregas():
                 'viatura_motorista': row_dict.get('viatura_motorista', '') or '',
                 'cliente': row_dict.get('cliente', '') or '',
                 'local_carga': local_carga,
-                'material': row_dict.get('material', '') or ''
+                'material': row_dict.get('material', '') or '',
+                'observacoes': row_dict.get('observacoes', '') or ''
             })
         
         print(f"DEBUG - Total de registros processados: {len(historico)}")
@@ -5304,7 +5768,7 @@ def get_historico_alteracoes():
         
         # Buscar todas as ações, ordenadas por data mais recente
         cursor.execute('''
-            SELECT id, tipo_acao, descricao, dados_acao, data_acao, revertido
+            SELECT id, tipo_acao, descricao, dados_acao, data_acao, revertido, user_nome, user_id
             FROM historico_acoes
             ORDER BY data_acao DESC
             LIMIT 200
@@ -5318,7 +5782,9 @@ def get_historico_alteracoes():
                 'descricao': row[2],
                 'dados_acao': row[3],
                 'data_acao': row[4],
-                'revertido': bool(row[5])
+                'revertido': bool(row[5]),
+                'user_nome': row[6],
+                'user_id': row[7]
             })
         
         conn.close()
@@ -5677,12 +6143,7 @@ def registrar_acao(tipo_acao, descricao, dados):
     try:
         conn = get_db()
         cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (tipo_acao, descricao, json.dumps(dados)))
-        
+        registar_historico_acao(cursor, tipo_acao, descricao, json.dumps(dados))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -5760,17 +6221,25 @@ def get_servico_dia_anterior(viatura_id):
 
 @app.route('/api/viatura-motorista/<int:viatura_id>/ultimo-servico', methods=['GET'])
 def get_ultimo_servico(viatura_id):
-    """Obter o último dia em que a viatura/motorista teve serviço atribuído (anterior à data atual)"""
+    """Obter o último dia em que a viatura/motorista teve serviço atribuído (anterior a uma data de referência)."""
     try:
-        from datetime import date
+        from datetime import date, datetime
         
-        data_atual = date.today()
-        data_atual_str = data_atual.isoformat()
+        # Permitir passar uma data de referência (?data_ref=AAAA-MM-DD); se não for passada, usar hoje
+        data_ref_str = request.args.get('data_ref')
+        if data_ref_str:
+            try:
+                data_ref = datetime.strptime(data_ref_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                data_ref = date.today()
+        else:
+            data_ref = date.today()
+        data_ref_iso = data_ref.isoformat()
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Buscar a última data em que houve serviço atribuído (anterior à data atual)
+        # Buscar a última data em que houve serviço atribuído (anterior à data de referência)
         cursor.execute('''
             SELECT 
                 ev.data_associacao,
@@ -5780,7 +6249,7 @@ def get_ultimo_servico(viatura_id):
             GROUP BY ev.data_associacao
             ORDER BY ev.data_associacao DESC
             LIMIT 1
-        ''', (viatura_id, data_atual_str))
+        ''', (viatura_id, data_ref_iso))
         
         ultima_data = cursor.fetchone()
         
@@ -5837,89 +6306,92 @@ def get_ultimo_servico(viatura_id):
 
 @app.route('/api/atribuicao/<int:atribuicao_id>/ultimo-servico', methods=['GET'])
 def get_ultimo_servico_atribuicao(atribuicao_id):
-    """Obter o último dia em que o conjunto (atribuição) teve serviço atribuído (anterior à data atual)"""
+    """Para a data de planeamento (data_ref), devolver o serviço do DIA ANTERIOR (data_ref - 1) para este conjunto."""
     try:
-        from datetime import date
+        from datetime import date, datetime, timedelta
         
-        data_atual = date.today()
-        data_atual_str = data_atual.isoformat()
+        data_ref_str = (request.args.get('data_ref') or '').strip()
+        if data_ref_str:
+            try:
+                data_ref = datetime.strptime(data_ref_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                try:
+                    data_ref = datetime.strptime(data_ref_str, '%d/%m/%Y').date()
+                except (ValueError, TypeError):
+                    data_ref = date.today()
+        else:
+            data_ref = date.today()
+        
+        # Dia anterior ao que estou a planear: 03/03 -> 02/03
+        data_anterior = data_ref - timedelta(days=1)
+        data_anterior_str = data_anterior.isoformat()
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Obter conjunto_id da atribuição
         cursor.execute('SELECT conjunto_id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
         atribuicao_row = cursor.fetchone()
         
         if not atribuicao_row:
             conn.close()
-            return jsonify({
-                'data': None,
-                'encomendas': []
-            })
+            return jsonify({'data': None, 'encomendas': []})
         
         conjunto_id = atribuicao_row[0]
         
-        # Buscar a última data em que houve serviço atribuído a este conjunto (anterior à data atual)
-        # Usar atribuicao_id ou conjunto_id para encontrar encomendas
+        # Motorista habitual do conjunto (para encomendas só com viatura_motorista_id)
         cursor.execute('''
-            SELECT 
-                ev.data_associacao,
-                COUNT(*) as total_encomendas
-            FROM encomenda_viatura ev
-            WHERE (ev.atribuicao_id = ? OR ev.atribuicao_id IN (
-                SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ?
-            ))
-            AND ev.data_associacao < ?
-            GROUP BY ev.data_associacao
-            ORDER BY ev.data_associacao DESC
-            LIMIT 1
-        ''', (atribuicao_id, conjunto_id, data_atual_str))
+            SELECT vm.id FROM viatura_motorista vm
+            INNER JOIN conjuntos_habituais c ON c.id = ?
+            INNER JOIN motoristas m ON m.id = c.motorista_id
+            WHERE UPPER(TRIM(vm.nome_motorista)) = UPPER(TRIM(m.nome)) AND vm.ativo = 1
+        ''', (conjunto_id,))
+        vm_ids = [r[0] for r in cursor.fetchall()]
         
-        ultima_data = cursor.fetchone()
+        placeholders_vm = ', '.join('?' * len(vm_ids)) if vm_ids else ''
+        params_enc = [conjunto_id, data_anterior_str]
+        if vm_ids:
+            params_enc.extend(vm_ids)
+        params_enc.append(data_anterior_str)
         
-        if not ultima_data:
-            conn.close()
-            return jsonify({
-                'data': None,
-                'encomendas': []
-            })
-        
-        data_ultima = ultima_data[0]
-        
-        # Buscar todas as encomendas dessa data para este conjunto
-        cursor.execute('''
+        # Encomendas do dia anterior: atribuição desse dia OU viatura_motorista_id (legado)
+        sql_enc = '''
             SELECT 
                 ev.pedido_id,
                 ev.pedido_tipo,
                 ev.ordem,
                 COALESCE(pp.cliente, pe.cliente) as cliente,
                 COALESCE(pp.local_carga, pe.local_carga) as local_carga,
-                COALESCE(pp.material, pe.material) as material
+                COALESCE(pp.material, pe.material) as material,
+                COALESCE(pp.local_descarga, pe.local_descarga, pp.local_carga, pe.local_carga, '') as local_descarga
             FROM encomenda_viatura ev
             LEFT JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
             LEFT JOIN pedidos_entregues pe ON ev.pedido_tipo = 'E' AND ev.pedido_id = pe.id
-            WHERE (ev.atribuicao_id = ? OR ev.atribuicao_id IN (
-                SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ?
-            ))
-            AND ev.data_associacao = ?
+            WHERE (
+                ev.atribuicao_id IN (
+                    SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ? AND date(data_atribuicao) = date(?)
+                )''' + ((' OR ev.viatura_motorista_id IN (' + placeholders_vm + ')') if placeholders_vm else '') + '''
+            )
+            AND date(ev.data_associacao) = date(?)
             ORDER BY ev.ordem ASC
-        ''', (atribuicao_id, conjunto_id, data_ultima))
+        '''
+        cursor.execute(sql_enc, params_enc)
         
         encomendas = cursor.fetchall()
         conn.close()
         
-        # Converter para lista de dicionários
         resultado = []
         for e in encomendas:
+            ld = (e[6] or '').strip() if len(e) > 6 else ''
+            lc = (e[4] or '').strip() if len(e) > 4 else ''
             resultado.append({
                 'cliente': e[3] or '',
-                'local_carga': e[4] or '',
-                'material': e[5] or ''
+                'local_carga': lc,
+                'material': e[5] or '',
+                'local_descarga': ld or lc
             })
         
         return jsonify({
-            'data': data_ultima,
+            'data': data_anterior_str,
             'encomendas': resultado
         })
     except Exception as e:
@@ -5932,6 +6404,71 @@ def get_ultimo_servico_atribuicao(atribuicao_id):
             except:
                 pass
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/atribuicao/<atribuicao_id>/avaria', methods=['GET', 'PUT', 'PATCH'])
+def atualizar_avaria_atribuicao(atribuicao_id):
+    """GET: estado atual. PUT/PATCH: marcar ou desmarcar avaria. Não apaga encomendas."""
+    try:
+        try:
+            atribuicao_id = int(atribuicao_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'ID de atribuição inválido'}), 400
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(atribuicoes_motoristas)")
+        cols = [row[1] for row in cursor.fetchall()]
+        if 'avaria_alteracao' not in cols:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Funcionalidade não disponível nesta base de dados.'}), 400
+        if request.method == 'GET':
+            cursor.execute(
+                'SELECT avaria_alteracao, avaria_observacao FROM atribuicoes_motoristas WHERE id = ?',
+                (atribuicao_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return jsonify({'success': False, 'error': 'Atribuição não encontrada'}), 404
+            return jsonify({
+                'success': True,
+                'avaria_alteracao': bool(row[0]),
+                'avaria_observacao': (row[1] or '') if len(row) > 1 else ''
+            })
+        data = request.get_json() or {}
+        avaria = data.get('avaria', data.get('avaria_alteracao', None))
+        observacao = (data.get('avaria_observacao') or data.get('observacao') or '').strip()
+        if avaria is True or avaria == 1 or avaria == '1':
+            cursor.execute('''
+                UPDATE atribuicoes_motoristas
+                SET avaria_alteracao = 1, avaria_observacao = ?
+                WHERE id = ?
+            ''', (observacao or None, atribuicao_id))
+        else:
+            cursor.execute('''
+                UPDATE atribuicoes_motoristas
+                SET avaria_alteracao = 0, avaria_observacao = NULL
+                WHERE id = ?
+            ''', (atribuicao_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        if 'conn' in locals():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/atribuicoes-motoristas/<atribuicao_id>/avaria', methods=['GET', 'PUT', 'PATCH'])
+def atualizar_avaria_atribuicao_alias(atribuicao_id):
+    """Alias: mesmo endpoint com path alternativo."""
+    return atualizar_avaria_atribuicao(atribuicao_id)
+
+try:
+    print('✓ Rotas /api/atribuicao/.../avaria e /api/atribuicoes-motoristas/.../avaria registadas.')
+except Exception:
+    pass
 
 # Verificar dependências na inicialização
 def verificar_dependencias():
@@ -6202,7 +6739,9 @@ def get_cards_planeamento():
                 cis.matricula as cisterna_matricula,
                 cis.codigo as cisterna_codigo,
                 m.nome as motorista_nome,
-                m_h.nome as motorista_habitual_nome
+                m_h.nome as motorista_habitual_nome,
+                COALESCE(a.avaria_alteracao, 0) as avaria_alteracao,
+                a.avaria_observacao as avaria_observacao
             FROM conjuntos_habituais c
             LEFT JOIN atribuicoes_motoristas a ON a.conjunto_id = c.id AND a.data_atribuicao = ?
             LEFT JOIN tratores t ON c.trator_id = t.id
@@ -6325,6 +6864,8 @@ def get_cards_planeamento():
                     'numero_noites_fora': passa_noite_dict.get((atrib.get('motorista_id') or motorista_habitual_id), 0),
                     'fora_continuacao': (atrib.get('motorista_id') or motorista_habitual_id) in fora_continuacao_dict,
                     'fora_continuacao_nivel': fora_continuacao_dict.get((atrib.get('motorista_id') or motorista_habitual_id), 0),
+                    'avaria_alteracao': bool(atrib.get('avaria_alteracao') or 0),
+                    'avaria_observacao': (atrib.get('avaria_observacao') or '').strip(),
                     'encomendas': []
                 }
                 
@@ -8516,8 +9057,22 @@ if __name__ == '__main__':
     
     import socket
     import subprocess
-    hostname = socket.gethostname()
-    ip_local = socket.gethostbyname(hostname)
+    # IP da rede local: método fiável (conectar a externo para obter IP real da interface LAN)
+    ip_local = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        s.connect(("8.8.8.8", 80))
+        ip_local = s.getsockname()[0]
+        s.close()
+    except Exception:
+        pass
+    if not ip_local or ip_local == '127.0.0.1':
+        try:
+            hostname = socket.gethostname()
+            ip_local = socket.gethostbyname(hostname) or '127.0.0.1'
+        except Exception:
+            ip_local = '127.0.0.1'
     tailscale_ip = None
     try:
         for cmd in [['tailscale', 'ip', '-4'], ['tailscale', 'ip', '--4'], ['tailscale.exe', 'ip', '-4']]:
@@ -8543,729 +9098,30 @@ if __name__ == '__main__':
     verificar_dependencias()
     print("=" * 60)
     
-    # Configurar acesso pela internet via Cloudflare Tunnel
-    # DESATIVADO: Use ServeZero ou outro túnel externamente
-    # Para usar Cloudflare, execute cloudflared manualmente em outra janela
+    # Sem túnel: servidor apenas na rede local (e Tailscale se tiver)
     url_publica = None
     app.config['URL_PUBLICA'] = None
 
-    _dir = os.path.dirname(os.path.abspath(__file__))
-    # Por defeito: túnel Cloudflare (sem token, funciona em redes corporativas). Ngrok só se existir usar_ngrok.txt
-    usar_ngrok_automatico = os.path.exists(os.path.join(_dir, 'usar_ngrok.txt'))
-    if not usar_ngrok_automatico:
-        print("🌐 Acesso fora da rede: túnel Cloudflare (aguarde ~15 s para a URL). Para usar ngrok, crie usar_ngrok.txt.")
-    if os.path.exists(os.path.join(_dir, 'ngrok_desativado.txt')):
-        usar_ngrok_automatico = False
-    if os.environ.get('NO_NGROK', '').strip().lower() in ('1', 'true', 'yes'):
-        usar_ngrok_automatico = False
-
-    usar_cloudflare_automatico = False  # quick tunnel é iniciado em thread quando url_publica é None
-
-    if usar_ngrok_automatico:
-        try:
-            import subprocess
-            import time
-            import json
-            import atexit
-            
-            print("🌐 Configurando acesso pela internet via ngrok...")
-            
-            # Verificar se ngrok está instalado
-            ngrok_path = None
-            possible_paths = ['ngrok', 'ngrok.exe']
-            
-            # Verificar se está no diretório atual
-            if os.path.exists('ngrok.exe'):
-                ngrok_path = 'ngrok.exe'
-            else:
-                # Verificar se está no PATH
-                for path in possible_paths:
-                    try:
-                        result = subprocess.run([path, 'version'], capture_output=True, timeout=5)
-                        if result.returncode == 0:
-                            ngrok_path = path
-                            break
-                    except:
-                        pass
-            
-            # Tentar usar pyngrok como alternativa
-            usar_pyngrok = False
-            if not ngrok_path:
-                try:
-                    from pyngrok import ngrok as pyngrok_module
-                    usar_pyngrok = True
-                    print("✅ pyngrok encontrado (alternativa ao ngrok.exe)")
-                except ImportError:
-                    print("⚠️  ngrok não encontrado. Tentando instalar pyngrok...")
-                    try:
-                        import subprocess
-                        import sys
-                        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'pyngrok', '-q'])
-                        from pyngrok import ngrok as pyngrok_module
-                        usar_pyngrok = True
-                        print("✅ pyngrok instalado e pronto!")
-                    except:
-                        print("⚠️  Não foi possível instalar pyngrok automaticamente.")
-                        print("   Para instalar manualmente:")
-                        print("   1. Execute: pip install pyngrok")
-                        print("   2. Ou baixe ngrok.exe de: https://ngrok.com/download")
-                        print("   Por agora, o servidor está disponível apenas na rede local.")
-            
-            if usar_pyngrok:
-                try:
-                    # Token e ficheiro de config para evitar erros de certificado (proxy/corporate)
-                    ngrok_token_file = os.path.join(os.path.dirname(__file__), 'ngrok_token.txt')
-                    ngrok_token = None
-                    if os.path.exists(ngrok_token_file):
-                        try:
-                            with open(ngrok_token_file, 'r', encoding='utf-8') as f:
-                                ngrok_token = f.read().strip()
-                                if ngrok_token:
-                                    pyngrok_module.set_auth_token(ngrok_token)
-                                    print(f"✅ Token ngrok configurado ({len(ngrok_token)} caracteres)")
-                        except Exception as e:
-                            print(f"⚠️  Erro ao ler token: {e}")
-                    
-                    if not ngrok_token:
-                        token_path_abs = os.path.abspath(ngrok_token_file)
-                        print("⚠️  Token ngrok em falta. Para acesso pela internet:")
-                        print(f"    1. Registe-se em https://dashboard.ngrok.com/signup e copie o seu authtoken")
-                        print(f"    2. Crie o ficheiro: {token_path_abs}")
-                        print(f"    3. Coloque dentro uma única linha com o token (sem aspas nem espaços extras)")
-                        raise RuntimeError("Token ngrok em falta")
-                    
-                    # Config ngrok: v3. Forçar bypass ao proxy corporativo (evita x509 / korgn.su.lennut.com)
-                    ngrok_config_path = os.path.join(os.path.dirname(__file__), 'ngrok_config.yml')
-                    config_abs = os.path.abspath(ngrok_config_path)
-                    _dir = os.path.dirname(os.path.abspath(__file__))
-                    ca_pem = os.path.join(_dir, 'ngrok_corporate_ca.pem')
-                    connect_cas_value = 'host'
-                    if os.path.isfile(ca_pem):
-                        ca_path_yaml = os.path.abspath(ca_pem).replace('\\', '/')
-                        connect_cas_value = f'"{ca_path_yaml}"'
-                        print(f"✅ A usar certificado CA corporativo: {ca_pem}")
-                    try:
-                        with open(ngrok_config_path, 'w', encoding='utf-8') as f:
-                            f.write('version: "3"\n')
-                            f.write('agent:\n')
-                            f.write(f'  authtoken: "{ngrok_token}"\n')
-                            f.write(f'  connect_cas: {connect_cas_value}\n')
-                            f.write('  region: eu\n')
-                            # Forçar sem proxy (proxy corporativo quebra TLS para tunnel.us.ngrok.com)
-                            f.write('  proxy_url: ""\n')
-                    except Exception as e:
-                        print(f"⚠️  Erro ao escrever config ngrok: {e}")
-                    # Forçar bypass total ao proxy: ngrok deve ligar direto a tunnel.us.ngrok.com
-                    _proxy_vars = ('NO_PROXY', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy')
-                    _proxy_antes = {k: os.environ.get(k) for k in _proxy_vars}
-                    for k in _proxy_vars:
-                        os.environ.pop(k, None)
-                    os.environ['NO_PROXY'] = '*'
-                    os.environ['no_proxy'] = '*'
-                    try:
-                        from pyngrok import conf as pyngrok_conf
-                        pyngrok_config = pyngrok_conf.PyngrokConfig(config_path=config_abs)
-                        public_url = pyngrok_module.connect(5000, pyngrok_config=pyngrok_config)
-                    except (AttributeError, TypeError):
-                        public_url = pyngrok_module.connect(5000)
-                    finally:
-                        for k in _proxy_vars:
-                            os.environ.pop(k, None)
-                        for k, v in _proxy_antes.items():
-                            if v is not None:
-                                os.environ[k] = v
-                    
-                    url_publica = str(public_url) if public_url else None
-                    if url_publica:
-                        app.config['URL_PUBLICA'] = url_publica
-                        print(f"✅ Túnel ngrok criado com sucesso!")
-                        print(f"🌍 URL Pública (Internet): {url_publica}")
-                        print(f"   ⚠️  Esta URL muda a cada reinício do servidor!")
-                        print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
-                except Exception as e:
-                    err_str = str(e).lower()
-                    print(f"⚠️  Erro ao criar túnel com pyngrok: {e}")
-                    print("   Por agora, o servidor está disponível apenas na rede local.")
-                    if 'x509' in err_str or 'certificate' in err_str or 'korgn' in err_str or 'unknown authority' in err_str:
-                        print("   Rede corporativa com proxy/DPI (ex.: korgn.su.lennut.com) intercepta HTTPS.")
-                        print("   Opções:")
-                        print("   1. Usar telemóvel em DADOS MÓVEIS como hotspot e ligar o PC a esse Wi-Fi (ngrok passa a funcionar).")
-                        print("   2. Pedir ao IT o certificado CA corporativo (root CA), gravar como ngrok_corporate_ca.pem nesta pasta.")
-                        print("   3. Desativar ngrok: crie ngrok_desativado.txt nesta pasta (o túnel Cloudflare será usado em alternativa).")
-            elif not ngrok_path:
-                print("⚠️  ngrok não encontrado. Acesso pela internet não disponível.")
-                print("   Para instalar:")
-                print("   1. Baixe de: https://ngrok.com/download")
-                print("   2. Coloque ngrok.exe nesta pasta")
-                print("   3. Ou instale pyngrok: pip install pyngrok")
-                print("   Por agora, o servidor está disponível apenas na rede local.")
-            else:
-                print(f"✅ ngrok encontrado: {ngrok_path}")
-                
-                ngrok_token_file = os.path.join(os.path.dirname(__file__), 'ngrok_token.txt')
-                ngrok_config_path = os.path.join(os.path.dirname(__file__), 'ngrok_config.yml')
-                ngrok_token = None
-                
-                if os.path.exists(ngrok_token_file):
-                    try:
-                        with open(ngrok_token_file, 'r', encoding='utf-8') as f:
-                            ngrok_token = f.read().strip()
-                            if ngrok_token:
-                                print(f"✅ Token ngrok carregado do ficheiro ({len(ngrok_token)} caracteres)")
-                                # Escrever config com root_cas: trusted (evita erros de certificado)
-                                with open(ngrok_config_path, 'w', encoding='utf-8') as cf:
-                                    cf.write('version: "2"\n')
-                                    cf.write(f'authtoken: "{ngrok_token}"\n')
-                                    cf.write('root_cas: trusted\n')
-                                    cf.write('region: us\n')
-                                config_abs = os.path.abspath(ngrok_config_path)
-                    except Exception as e:
-                        print(f"⚠️  Erro ao ler token: {e}")
-                        config_abs = None
-                else:
-                    config_abs = None
-                
-                # Iniciar ngrok em background (usar config com root_cas: trusted se existir)
-                print("🚀 Criando túnel ngrok (URL aleatória)...")
-                cmd = [ngrok_path, 'http', '5000']
-                if config_abs and os.path.exists(ngrok_config_path):
-                    cmd.extend(['--config', config_abs])
-                ngrok_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                # Registrar função para encerrar ngrok ao sair
-                def encerrar_ngrok():
-                    try:
-                        if ngrok_process and ngrok_process.poll() is None:
-                            ngrok_process.terminate()
-                            ngrok_process.wait(timeout=5)
-                    except:
-                        pass
-                
-                atexit.register(encerrar_ngrok)
-                
-                # Aguardar ngrok iniciar e obter URL
-                time.sleep(3)
-                
-                # Tentar obter URL da API do ngrok
-                try:
-                    import urllib.request
-                    response = urllib.request.urlopen('http://localhost:4040/api/tunnels', timeout=5)
-                    data = json.loads(response.read().decode())
-                    
-                    if data.get('tunnels') and len(data['tunnels']) > 0:
-                        url_publica = data['tunnels'][0]['public_url']
-                        app.config['URL_PUBLICA'] = url_publica
-                        print(f"✅ Túnel ngrok criado com sucesso!")
-                        print(f"🌍 URL Pública (Internet): {url_publica}")
-                        print(f"   ⚠️  Esta URL muda a cada reinício do servidor!")
-                        print(f"   ⚠️  Esta URL permite acesso de qualquer lugar na internet!")
-                        print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
-                        print(f"   💡 Para ver a URL novamente: http://localhost:4040")
-                    else:
-                        print("⚠️  ngrok iniciado, mas URL ainda não disponível.")
-                        print("   Aguarde alguns segundos e verifique: http://localhost:4040")
-                except Exception as e:
-                    print("⚠️  ngrok iniciado, mas não foi possível obter URL automaticamente.")
-                    print("   Verifique a URL em: http://localhost:4040")
-                    print("   Ou veja a janela do ngrok se abriu.")
-                
-        except Exception as e:
-            error_msg = str(e)
-            print(f"⚠️  Erro ao configurar ngrok: {error_msg}")
-            print("   O servidor continuará disponível apenas na rede local.")
-            print("   Verifique se tem conexão à internet e ngrok instalado.")
-    
-    # Túnel Cloudflare: só iniciar DEPOIS do Flask estar a escutar (em thread com atraso)
-    def _iniciar_cloudflared_apos_servidor():
-        import time
-        import subprocess
-        import atexit
-        global url_publica
-        try:
-            import re
-            import queue
-            import urllib.request
-            import ssl
-            # Esperar o Flask estar a escutar em 127.0.0.1:5000
-            flask_ready = False
-            for _ in range(45):
-                time.sleep(1)
-                try:
-                    req = urllib.request.Request('http://127.0.0.1:5000/tunnel-ok', headers={'User-Agent': 'TunnelReady/1'})
-                    with urllib.request.urlopen(req, timeout=3) as r:
-                        if r.status == 200:
-                            flask_ready = True
-                            break
-                except Exception:
-                    pass
-            if not flask_ready:
-                return
-            _base = os.path.dirname(os.path.abspath(__file__))
-            cloudflared_exe = os.path.join(_base, 'cloudflared.exe')
-            cloudflared_path = None
-            for path in ['cloudflared', 'cloudflared.exe', cloudflared_exe]:
-                try:
-                    r = subprocess.run([path, 'version'], capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        cloudflared_path = path
-                        break
-                except Exception:
-                    pass
-            if not cloudflared_path and os.name == 'nt':
-                try:
-                    ctx = ssl.create_default_context()
-                    req = urllib.request.Request('https://api.github.com/repos/cloudflare/cloudflared/releases/latest', headers={'Accept': 'application/vnd.github.v3+json'})
-                    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                        data = json.loads(resp.read().decode())
-                    for asset in data.get('assets', []):
-                        name = (asset.get('name') or '').lower()
-                        if 'windows' in name and 'amd64' in name and (name.endswith('.exe') or 'exe' in name):
-                            with urllib.request.urlopen(asset.get('browser_download_url'), timeout=60, context=ctx) as resp2:
-                                with open(cloudflared_exe, 'wb') as f:
-                                    f.write(resp2.read())
-                            cloudflared_path = cloudflared_exe
-                            break
-                except Exception:
-                    pass
-            if not cloudflared_path:
-                return
-            # Diretório de config vazio: quick tunnel falha se existir config em .cloudflared
-            import tempfile
-            _cf_config_dir = tempfile.mkdtemp(prefix='cf_tunnel_')
-            _cf_env = os.environ.copy()
-            _cf_env['CLOUDFLARED_CONFIG_DIR'] = _cf_config_dir
-            print("🌐 A iniciar Cloudflare Tunnel (servidor já está no ar)...")
-            cf_process = subprocess.Popen(
-                [cloudflared_path, 'tunnel', '--url', 'http://127.0.0.1:5000'],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=_cf_env, cwd=_cf_config_dir
-            )
-            output_queue = queue.Queue()
-            def _read_cf():
-                try:
-                    for line in iter(cf_process.stdout.readline, ''):
-                        if line:
-                            output_queue.put(line)
-                except Exception:
-                    pass
-            threading.Thread(target=_read_cf, daemon=True).start()
-            for _ in range(45):
-                time.sleep(1)
-                if cf_process.poll() is not None:
-                    break
-                try:
-                    while True:
-                        line = output_queue.get_nowait()
-                        m = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
-                        if m:
-                            url_publica = m.group(0).strip().rstrip(').')
-                            app.config['URL_PUBLICA'] = url_publica
-                            break
-                except queue.Empty:
-                    pass
-                if url_publica:
-                    break
-            if url_publica:
-                time.sleep(8)  # Dar tempo ao Cloudflare registar o túnel
-                ok = False
-                for _ in range(5):
-                    try:
-                        req = urllib.request.Request(
-                            url_publica + '/tunnel-ok',
-                            headers={'User-Agent': 'Mozilla/5.0 (tunnel-check)'}
-                        )
-                        with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as r:
-                            body = r.read()
-                            ok = (r.status == 200 and body.startswith(b'OK'))
-                        if ok:
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(5)
-                if ok:
-                    print(f"✅ Túnel Cloudflare ativo e a responder!")
-                    print(f"🌍 Abrir fora da rede (telemóvel/dados): {url_publica}")
-                    print(f"   Login: {url_publica}/  (teste: {url_publica}/tunnel-ok)")
-                else:
-                    # Cloudflare deu URL mas verificação falhou (rede pode bloquear trycloudflare.com). Tentar localhost.run (SSH).
-                    print(f"⚠️  Túnel Cloudflare criado mas não respondeu (a rede pode bloquear trycloudflare.com). A tentar localhost.run...")
-                    _lh_url = None
-                    try:
-                        _ssh_cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL' if os.name == 'nt' else 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=20', '-R', '80:localhost:5000', 'nokey@localhost.run']
-                        _p = subprocess.Popen(_ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-                        for _ in range(30):
-                            time.sleep(1)
-                            if _p.poll() is not None:
-                                break
-                            try:
-                                _line = _p.stdout.readline()
-                                if not _line:
-                                    continue
-                                _line = _line.strip()
-                                # localhost.run emite JSON {"domain":"xxx.localhost.run",...} ou "Connect to http://xxx.localhost.run"
-                                if '"domain"' in _line or 'Connect to' in _line:
-                                    try:
-                                        _j = json.loads(_line)
-                                        _dom = (_j.get('domain') or '').strip()
-                                        if _dom and '.localhost.run' in _dom and 'admin' not in _dom.lower():
-                                            _lh_url = 'https://' + _dom.replace('http://', '').replace('https://', '').strip()
-                                            break
-                                    except Exception:
-                                        pass
-                                if 'Connect to ' in _line:
-                                    _m2 = re.search(r'Connect to (https?://[^\s"\']+\.localhost\.run)', _line)
-                                    if _m2 and 'admin' not in _m2.group(1).lower():
-                                        _lh_url = _m2.group(1).strip().rstrip(').,;')
-                                        break
-                                _m = re.search(r'https?://([a-zA-Z0-9][a-zA-Z0-9.-]*)\.localhost\.run', _line)
-                                if _m and 'admin' not in _m.group(1).lower():
-                                    _lh_url = _m.group(0).strip().rstrip(').,;')
-                                    break
-                            except Exception:
-                                pass
-                        if _lh_url:
-                            _cf_url_backup = url_publica  # guardar Cloudflare para alternativa
-                            url_publica = _lh_url
-                            app.config['URL_PUBLICA'] = url_publica
-                            if _cf_url_backup:
-                                app.config['URL_PUBLICA_ALT'] = _cf_url_backup
-                            print(f"✅ Túnel localhost.run ativo!")
-                            print(f"🌍 Abrir fora da rede: {url_publica}")
-                            if _cf_url_backup:
-                                print(f"   Se não abrir: no telemóvel em DADOS MÓVEIS use: {_cf_url_backup}")
-                            try:
-                                cf_process.terminate()
-                                cf_process.wait(timeout=3)
-                            except Exception:
-                                pass
-                            def _fechar_ssh():
-                                try:
-                                    if _p.poll() is None:
-                                        _p.terminate()
-                                        _p.wait(timeout=5)
-                                except Exception:
-                                    pass
-                            atexit.register(_fechar_ssh)
-                        else:
-                            _p.terminate()
-                            try:
-                                _p.wait(timeout=2)
-                            except Exception:
-                                pass
-                    except Exception as _e:
-                        pass
-                    if not _lh_url:
-                        print(f"🌍 URL Cloudflare (pode não funcionar nesta rede): {url_publica}")
-                        print(f"   Tente no telemóvel em DADOS MÓVEIS, ou noutra rede. Se falhar: use hotspot do telemóvel no PC e reinicie a app.")
-                def _fechar_cf():
-                    try:
-                        if cf_process.poll() is None:
-                            cf_process.terminate()
-                            cf_process.wait(timeout=5)
-                    except Exception:
-                        pass
-                atexit.register(_fechar_cf)
-            else:
-                try:
-                    cf_process.terminate()
-                    cf_process.wait(timeout=3)
-                except Exception:
-                    pass
-        except Exception as e:
-            print(f"   ⚠️  Túnel Cloudflare: {e}")
-    
-    if url_publica is None:
-        threading.Thread(target=_iniciar_cloudflared_apos_servidor, daemon=True).start()
-        print("   💡 Túnel Cloudflare: aguarde ~15 s. Depois abra no browser  http://127.0.0.1:5000/qr  para ver o link e o QR code (telemóvel).")
-    
-    if usar_cloudflare_automatico:
-        try:
-            import subprocess
-            import json
-            import atexit
-            import time
-            import threading
-            
-            print("🌐 Configurando acesso pela internet via Cloudflare Tunnel...")
-            
-            # Verificar se cloudflared está instalado
-            cloudflared_path = None
-            possible_paths = ['cloudflared', 'cloudflared.exe']
-            
-            # Verificar se está no PATH
-            for path in possible_paths:
-                try:
-                    result = subprocess.run([path, 'version'], capture_output=True, timeout=5)
-                    if result.returncode == 0:
-                        cloudflared_path = path
-                        break
-                except:
-                    pass
-            
-            if not cloudflared_path:
-                print("⚠️  cloudflared não encontrado. Acesso pela internet não disponível.")
-                print("   Para instalar:")
-                print("   1. Baixe de: https://github.com/cloudflare/cloudflared/releases")
-                print("   2. Ou execute: INSTALAR_CLOUDFLARED.bat")
-                print("   3. Depois reinicie o servidor")
-                print("   Por agora, o servidor está disponível apenas na rede local.")
-            else:
-                print(f"✅ cloudflared encontrado: {cloudflared_path}")
-            
-            # Verificar se existe domínio/subdomínio configurado
-            cloudflare_domain_file = os.path.join(os.path.dirname(__file__), 'cloudflare_domain.txt')
-            cloudflare_domain = None
-            
-            if os.path.exists(cloudflare_domain_file):
-                try:
-                    with open(cloudflare_domain_file, 'r', encoding='utf-8') as f:
-                        cloudflare_domain = f.read().strip()
-                        cloudflare_domain = cloudflare_domain.replace(' ', '').replace('\n', '').replace('\r', '').replace('\t', '')
-                        if cloudflare_domain:
-                            print(f"✅ Subdomínio Cloudflare configurado: {cloudflare_domain}")
-                        else:
-                            cloudflare_domain = None
-                except Exception as e:
-                    print(f"⚠️  Erro ao ler subdomínio: {e}")
-                    cloudflare_domain = None
-            
-            # Criar túnel Cloudflare
-            try:
-                cloudflared_process = None
-                
-                if cloudflare_domain:
-                    # Usar subdomínio personalizado (URL fixa)
-                    print(f"🚀 Criando túnel com subdomínio fixo: {cloudflare_domain}...")
-                    # Para usar túnel nomeado com subdomínio, precisa criar/configurar arquivo de configuração
-                    # OU usar o método mais simples: tunnel run com configuração inline
-                    
-                    # Verificar se existe túnel "pragosa"
-                    try:
-                        check_result = subprocess.run(
-                            [cloudflared_path, 'tunnel', 'list'],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
-                        )
-                        tem_tunel_pragosa = 'pragosa' in check_result.stdout
-                    except:
-                        tem_tunel_pragosa = False
-                    
-                    if tem_tunel_pragosa:
-                        # Usar túnel nomeado "pragosa" - já está configurado
-                        print(f"✅ Túnel 'pragosa' encontrado - usando configuração existente")
-                        print(f"   O ficheiro config.yml já está configurado com: {cloudflare_domain}")
-                        
-                        # Rodar túnel nomeado (usa config.yml existente)
-                        try:
-                            cloudflared_process = subprocess.Popen(
-                                [cloudflared_path, 'tunnel', 'run', 'pragosa'],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True
-                            )
-                        except Exception as config_error:
-                            print(f"⚠️  Erro ao iniciar túnel: {config_error}")
-                            print(f"   Tentando método alternativo...")
-                            # Fallback: usar método simples
-                            cloudflared_process = subprocess.Popen(
-                                [cloudflared_path, 'tunnel', '--url', f'http://localhost:5000', '--hostname', cloudflare_domain],
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True
-                            )
-                    else:
-                        # Sem túnel nomeado, usar método simples
-                        cloudflared_process = subprocess.Popen(
-                            [cloudflared_path, 'tunnel', '--url', f'http://localhost:5000', '--hostname', cloudflare_domain],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True
-                        )
-                    
-                    # Dar tempo para o túnel iniciar e verificar erros
-                    time.sleep(3)
-                    
-                    # Verificar se processo ainda está rodando (se não, houve erro)
-                    if cloudflared_process.poll() is not None:
-                        # Processo terminou, ler output para ver erro
-                        try:
-                            output = cloudflared_process.stdout.read()
-                            error_msg = output[:500] if output else 'Erro desconhecido'
-                            print(f"⚠️  Erro ao iniciar túnel: {error_msg}")
-                            print(f"   Tentando método alternativo...")
-                            # Tentar método mais simples sem hostname específico
-                            cloudflared_process = subprocess.Popen(
-                                [cloudflared_path, 'tunnel', '--url', 'http://localhost:5000'],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL
-                            )
-                            url_publica = None  # Não definir URL, mas processo continua
-                            print(f"⚠️  Túnel iniciado sem subdomínio fixo.")
-                            print(f"   Configure manualmente ou use URL aleatória.")
-                        except:
-                            raise Exception("cloudflared terminou inesperadamente. Verifique se o subdomínio está configurado corretamente.")
-                    else:
-                        url_publica = f"https://{cloudflare_domain}"
-                        print(f"✅ Túnel Cloudflare criado com sucesso!")
-                        print(f"🌍 URL Pública (Internet): {url_publica}")
-                        print(f"   ✅ Esta URL será sempre a mesma!")
-                        print(f"   ⚠️  Esta URL permite acesso de qualquer lugar na internet!")
-                        print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
-                else:
-                    # Usar URL aleatória (quick tunnel)
-                    print(f"🚀 Criando túnel rápido (URL aleatória)...")
-                    print("   Aguardando URL do túnel (pode demorar alguns segundos)...")
-                    
-                    # Iniciar cloudflared em background e ler URL do output
-                    cloudflared_process = subprocess.Popen(
-                        [cloudflared_path, 'tunnel', '--url', 'http://localhost:5000'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1
-                    )
-                    
-                    # Ler output usando threading (melhor para Windows)
-                    import re
-                    import queue
-                    url_encontrada = False
-                    url_publica_temp = None
-                    output_queue = queue.Queue()
-                    
-                    def read_output():
-                        """Thread para ler output do cloudflared"""
-                        try:
-                            for line in iter(cloudflared_process.stdout.readline, ''):
-                                if line:
-                                    output_queue.put(line)
-                        except:
-                            pass
-                    
-                    # Iniciar thread de leitura
-                    reader_thread = threading.Thread(target=read_output, daemon=True)
-                    reader_thread.start()
-                    
-                    # Aguardar URL por até 30 segundos
-                    max_tentativas = 30
-                    for tentativa in range(max_tentativas):
-                        time.sleep(1)
-                        
-                        # Verificar se processo terminou
-                        if cloudflared_process.poll() is not None:
-                            # Processo terminou, tentar ler última linha da queue
-                            try:
-                                while True:
-                                    line = output_queue.get_nowait()
-                                    url_match = re.search(r'https://[^\s]+\.trycloudflare\.com', line)
-                                    if url_match:
-                                        url_publica_temp = url_match.group(0)
-                                        url_encontrada = True
-                                        break
-                            except queue.Empty:
-                                pass
-                            
-                            if not url_encontrada:
-                                raise Exception("cloudflared terminou antes de obter URL")
-                            break
-                        
-                        # Tentar ler da queue
-                        try:
-                            while True:
-                                line = output_queue.get_nowait()
-                                url_match = re.search(r'https://[^\s]+\.trycloudflare\.com', line)
-                                if url_match:
-                                    url_publica_temp = url_match.group(0)
-                                    url_encontrada = True
-                                    break
-                        except queue.Empty:
-                            pass
-                        
-                        if url_encontrada:
-                            break
-                    
-                    if url_encontrada and url_publica_temp:
-                        url_publica = url_publica_temp
-                        print(f"✅ Túnel Cloudflare criado com sucesso!")
-                        print(f"🌍 URL Pública (Internet): {url_publica}")
-                        print(f"   ⚠️  Esta URL muda a cada reinício do servidor.")
-                        print(f"   💡 Para URL fixa, configure um subdomínio (ver COMO_CONFIGURAR_CLOUDFLARE.txt)")
-                        print(f"   ⚠️  Esta URL permite acesso de qualquer lugar na internet!")
-                        print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
-                    else:
-                        # Se não encontrou URL, manter processo rodando e informar
-                        print(f"⚠️  Não foi possível extrair URL automaticamente do output.")
-                        print(f"   O túnel está rodando em background.")
-                        print(f"   Verifique manualmente executando: cloudflared tunnel --url http://localhost:5000")
-                        print(f"   OU configure um subdomínio fixo executando: EXECUTAR_CONFIGURACAO_COMPLETA.bat")
-                        url_publica = None  # Não definir URL, mas processo continua rodando
-                
-                # Guardar referência ao processo para fechar depois
-                cloudflared_process_ref = cloudflared_process
-                
-                # Registrar função para fechar cloudflared ao sair
-                def fechar_cloudflared():
-                    try:
-                        if cloudflared_process_ref and cloudflared_process_ref.poll() is None:
-                            cloudflared_process_ref.terminate()
-                            cloudflared_process_ref.wait(timeout=5)
-                            print("\n🔒 Túnel Cloudflare fechado")
-                    except:
-                        try:
-                            if cloudflared_process_ref:
-                                cloudflared_process_ref.kill()
-                        except:
-                            pass
-                
-                atexit.register(fechar_cloudflared)
-                
-            except FileNotFoundError:
-                print("⚠️  cloudflared não encontrado no sistema.")
-                print("   Para instalar:")
-                print("   1. Baixe de: https://github.com/cloudflare/cloudflared/releases")
-                print("   2. Ou execute: INSTALAR_CLOUDFLARED.bat")
-                print("   3. Adicione ao PATH ou coloque na pasta do projeto")
-            except Exception as cloudflare_error:
-                error_msg = str(cloudflare_error)
-                print(f"⚠️  Erro ao configurar Cloudflare Tunnel: {error_msg}")
-                print("   O servidor continuará disponível apenas na rede local.")
-                print("   Verifique se tem conexão à internet e cloudflared instalado.")
-        except Exception as e:
-            error_msg = str(e)
-            print(f"⚠️  Erro ao configurar Cloudflare Tunnel: {error_msg}")
-            print("   O servidor continuará disponível apenas na rede local.")
-            print("   Verifique se tem conexão à internet e tente novamente.")
-    else:
-        if url_publica is not None:
-            print("ℹ️  Cloudflare Tunnel automático desativado (ngrok ativo).")
-        # Se url_publica é None, já foi mostrada a dica de instalar cloudflared no fallback
-    
     print(f"Servidor iniciado em:")
-    print(f"  - Local: http://127.0.0.1:5000")
-    print(f"  - Rede Local: http://{ip_local}:5000")
+    print(f"  - Neste PC: http://127.0.0.1:8080")
+    todos_ips = _obter_todos_ips_locais()
+    ips_rede = [ip for ip in todos_ips if ip != '127.0.0.1']
+    if ips_rede:
+        print(f"  - Outro PC/telemovel (mesma Wi-Fi): tente cada um destes (se um nao abrir, teste o outro):")
+        for ip in sorted(ips_rede, key=lambda x: (0 if x.startswith('192.168.') else 1, x)):
+            print(f"      http://{ip}:8080   (teste primeiro: http://{ip}:8080/teste-rede)")
+    else:
+        print(f"  - Outro PC/telemovel: http://{ip_local}:8080")
+    if ip_local != '127.0.0.1' or ips_rede:
+        print(f"  >>> Se nao abrir noutro PC: 1) PERMITIR_PORTA_8080_FIREWALL.bat (como Admin)  2) Instrucoes: http://127.0.0.1:8080/rede")
     if tailscale_ip:
-        print(f"  - Tailscale (outra rede): http://{tailscale_ip}:5000")
-    if url_publica:
-        print(f"  - Internet: {url_publica}")
+        print(f"  - Tailscale: http://{tailscale_ip}:8080")
+    print(f"  >>> Solucao que funciona: http://127.0.0.1:8080/colocar-online  (colocar app online = link em todo o lado)")
     print(f"Banco de dados: {DATABASE}")
     print("=" * 60)
-    print(f"Telemovel na MESMA Wi-Fi:  http://{ip_local}:5000")
-    if url_publica:
-        print(f"ABRIR FORA DA REDE (telemovel/dados):  {url_publica}")
-    elif tailscale_ip:
-        print(f"Telemovel noutra rede:  http://{tailscale_ip}:5000  (Tailscale)")
-    else:
-        print("Fora da rede: aguarde a URL do túnel (Cloudflare) acima em ~15 s, ou use Tailscale.")
-    if not url_publica:
-        print("")
-        print(">>> ABRIR NO TELEMOVEL (facil, sem instalar nada):")
-        print("    No telemovel: desligue o Wi-Fi e use DADOS MOVEIS. Depois abra no browser")
-        print("    a URL Cloudflare que apareceu acima (ou em  http://127.0.0.1:5000/acesso-remoto ).")
-        print("")
+    print(f"Telemovel mesma Wi-Fi:  http://{ip_local}:8080")
+    if tailscale_ip:
+        print(f"Telemovel outra rede (Tailscale):  http://{tailscale_ip}:8080")
     print("=" * 60)
     
     # Abrir navegador automaticamente após 2 segundos
@@ -9280,7 +9136,7 @@ if __name__ == '__main__':
         time.sleep(2)  # Aguardar servidor iniciar
         if not navegador_aberto['aberto']:
             navegador_aberto['aberto'] = True
-            webbrowser.open('http://127.0.0.1:5000')
+            webbrowser.open('http://127.0.0.1:8080')
     
     threading.Thread(target=abrir_navegador, daemon=True).start()
     
@@ -9321,7 +9177,7 @@ if __name__ == '__main__':
         print(traceback.format_exc())
         return jsonify({'error': f'Erro: {str(e)}'}), 500
     
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False, threaded=True)
 
 
 
