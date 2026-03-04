@@ -1041,11 +1041,19 @@ document.addEventListener('DOMContentLoaded', function() {
         dashboardContainer.style.display = 'none';
     }
     
-    // Definir data padrão como hoje apenas se não houver valor definido
+    // Restaurar data guardada (para que F5 não volte ao dia atual) ou usar hoje
     const dataInput = document.getElementById('dataPlaneamento');
-    if (dataInput && !dataInput.value) {
-        const today = new Date().toISOString().split('T')[0];
-        dataInput.value = today;
+    const STORAGE_KEY = 'dataPlaneamento';
+    if (dataInput) {
+        const saved = sessionStorage.getItem(STORAGE_KEY);
+        const validDate = /^\d{4}-\d{2}-\d{2}$/.test(saved);
+        if (validDate) {
+            dataInput.value = saved;
+        } else if (!dataInput.value) {
+            const today = new Date().toISOString().split('T')[0];
+            dataInput.value = today;
+            sessionStorage.setItem(STORAGE_KEY, today);
+        }
     }
     
     // Botão hambúrguer sempre visível
@@ -1058,6 +1066,7 @@ document.addEventListener('DOMContentLoaded', function() {
     if (dataInput && !dataInput.value) {
         const today = new Date().toISOString().split('T')[0];
         dataInput.value = today;
+        sessionStorage.setItem(STORAGE_KEY, today);
     }
     
     // NÃO carregar dados iniciais automaticamente - só quando escolher uma janela
@@ -1066,6 +1075,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Adicionar event listeners
     if (dataInput) {
         dataInput.addEventListener('change', function() {
+            sessionStorage.setItem(STORAGE_KEY, dataInput.value || '');
             resetarDesbloqueio(); // Resetar desbloqueio quando a data mudar
             atualizarIndicadorVisualizacao(); // Atualizar indicador
             atualizarLista();
@@ -1118,6 +1128,18 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // ==================== CARREGAMENTO DE DADOS ====================
+
+/** Atualiza os dados (planeamento, pendentes, motoristas) para a data atualmente selecionada, sem alterar a data. */
+function atualizarDadosSemMudarData() {
+    const dataInput = document.getElementById('dataPlaneamento');
+    if (!dataInput || !dataInput.value) {
+        return;
+    }
+    atualizarIndicadorVisualizacao();
+    atualizarLista();
+    carregarEncomendasPendentesDia();
+    carregarViaturasMotoristas();
+}
 
 async function carregarTodosDados() {
     await Promise.all([
@@ -1406,57 +1428,64 @@ function renderizarEncomendasPendentesComFuturos(encomendasDia, encomendasFutura
         podeMover = true;
     }
     
+    const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const sortByLocalDescarga = (a, b) => {
+        const x = (a.local_descarga || a.localDescarga || '').trim().toLowerCase();
+        const y = (b.local_descarga || b.localDescarga || '').trim().toLowerCase();
+        if (!x && !y) return 0;
+        if (!x) return 1;
+        if (!y) return -1;
+        return x.localeCompare(y, 'pt');
+    };
+    
     let html = '';
     
-    // Renderizar encomendas do dia atual
+    // Renderizar encomendas do dia atual (ordem alfabética por local de descarga, zebra nas linhas)
     if (encomendasDia && encomendasDia.length > 0) {
-        html += encomendasDia.map(item => {
+        const diaOrdenado = [...encomendasDia].sort(sortByLocalDescarga);
+        diaOrdenado.forEach((item, idx) => {
             const estaSelecionado = pedidoIdSelecionado === item.id;
             const classeSelecionada = estaSelecionado ? ' encomenda-selecionada' : '';
             const prioridade = item.prioridade === 1 || item.prioridade === true;
             const classePrioridade = prioridade ? ' encomenda-prioridade' : '';
-            return `
+            const zebra = idx % 2 === 0 ? ' zebra-impar' : ' zebra-par';
+            html += `
             <tr data-id="${item.id}" 
                 data-tipo="P" 
                 data-pedido-id="${item.id}"
                 data-data-entrega="${item.data_entrega || ''}"
                 data-prioridade="${prioridade ? '1' : '0'}"
                 draggable="${podeMover ? 'true' : 'false'}"
-                class="encomenda-draggable ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
+                class="encomenda-draggable${zebra} ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
                 ondragstart="handleDragStart(event)"
                 ondragend="handleDragEnd(event)"
                 oncontextmenu="event.preventDefault(); mostrarContextMenu(event, ${item.id}, '${(item.data_entrega || '').replace(/'/g, "\\'")}', ${prioridade ? 'true' : 'false'});">
-                <td>${item.cliente || ''}</td>
-                <td>${item.local_descarga || item.localDescarga || ''}</td>
-                <td>${item.local_carga || item.cliente || ''}</td>
-                <td>${item.material || ''}</td>
-                <td>${item.observacoes || ''}</td>
-            </tr>
-        `;
-        }).join('');
+                <td>${esc(item.cliente)}</td>
+                <td>${esc(item.local_descarga || item.localDescarga)}</td>
+                <td>${esc(item.local_carga || item.cliente)}</td>
+                <td>${esc(item.material)}</td>
+                <td>${esc(item.observacoes)}</td>
+            </tr>`;
+        });
     } else {
         html += '<tr><td colspan="5" class="empty">Nenhuma encomenda pendente para esta data</td></tr>';
     }
     
-    // Encomendas dos próximos dias (sem separador "Próximos dias")
+    // Encomendas dos próximos dias (zebra nas linhas)
     if (encomendasFuturas && Object.keys(encomendasFuturas).length > 0) {
-        // Ordenar datas
         const datasOrdenadas = Object.keys(encomendasFuturas).sort();
-        
         datasOrdenadas.forEach(dataFutura => {
             const encomendas = encomendasFuturas[dataFutura];
             const dataFormatada = new Date(dataFutura + 'T00:00:00').toLocaleDateString('pt-PT', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-            
-            // Cabeçalho do dia
             html += `<tr class="dia-futuro-header"><td colspan="5">📆 ${dataFormatada}</td></tr>`;
-            
-            // Encomendas do dia (dias futuros: não permitir arrastar para cards do dia atual — usar Antecipar primeiro)
-            html += encomendas.map(item => {
+            const futurasOrdenadas = [...(encomendas || [])].sort(sortByLocalDescarga);
+            futurasOrdenadas.forEach((item, idx) => {
                 const estaSelecionado = pedidoIdSelecionado === item.id;
                 const classeSelecionada = estaSelecionado ? ' encomenda-selecionada' : '';
                 const prioridade = item.prioridade === 1 || item.prioridade === true;
                 const classePrioridade = prioridade ? ' encomenda-prioridade' : '';
-                return `
+                const zebra = idx % 2 === 0 ? ' zebra-impar' : ' zebra-par';
+                html += `
                 <tr data-id="${item.id}" 
                     data-tipo="P" 
                     data-pedido-id="${item.id}"
@@ -1465,24 +1494,22 @@ function renderizarEncomendasPendentesComFuturos(encomendasDia, encomendasFutura
                     data-dia-futuro="true"
                     draggable="false"
                     title="Use «Antecipar» para mover para o dia atual e depois atribuir ao card"
-                    class="encomenda-draggable encomenda-futura encomenda-dia-futuro-no-drag ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
+                    class="encomenda-draggable encomenda-futura encomenda-dia-futuro-no-drag${zebra} ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
                     ondragstart="handleDragStart(event)"
                     ondragend="handleDragEnd(event)"
                     oncontextmenu="event.preventDefault(); mostrarContextMenu(event, ${item.id}, '${(item.data_entrega || '').replace(/'/g, "\\'")}', ${prioridade ? 'true' : 'false'});">
-                    <td>${item.cliente || ''}</td>
-                    <td>${item.local_descarga || item.localDescarga || ''}</td>
-                    <td>${item.local_carga || item.cliente || ''}</td>
-                    <td>${item.material || ''}</td>
+                    <td>${esc(item.cliente)}</td>
+                    <td>${esc(item.local_descarga || item.localDescarga)}</td>
+                    <td>${esc(item.local_carga || item.cliente)}</td>
+                    <td>${esc(item.material)}</td>
                     <td>
-                        ${item.observacoes || ''}
-                        <button onclick="anteciparEncomenda(${item.id}, '${item.data_entrega}', '${document.getElementById('dataPlaneamento').value}')" 
-                                class="btn btn-sm btn-success" 
-                                style="margin-left: 10px; padding: 2px 8px; font-size: 11px;"
+                        ${esc(item.observacoes)}
+                        <button onclick="anteciparEncomenda(${item.id}, '${(item.data_entrega || '').replace(/'/g, "\\'")}', '${(document.getElementById('dataPlaneamento') && document.getElementById('dataPlaneamento').value) || ''}')" 
+                                class="btn btn-sm btn-success btn-antecipar-compact"
                                 title="Antecipar para hoje">⏫ Antecipar</button>
                     </td>
-                </tr>
-            `;
-            }).join('');
+                </tr>`;
+            });
         });
     }
     
@@ -1570,30 +1597,42 @@ function renderizarEncomendasPendentes(dados) {
         podeMover = true; // Por segurança, permitir movimentos se houver erro
     }
     
-    tbody.innerHTML = dados.map(item => {
+    const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const sortByLocalDescarga = (a, b) => {
+        const x = (a.local_descarga || a.localDescarga || '').trim().toLowerCase();
+        const y = (b.local_descarga || b.localDescarga || '').trim().toLowerCase();
+        if (!x && !y) return 0;
+        if (!x) return 1;
+        if (!y) return -1;
+        return x.localeCompare(y, 'pt');
+    };
+    const dadosOrdenados = [...dados].sort(sortByLocalDescarga);
+    let html = '';
+    dadosOrdenados.forEach((item, idx) => {
         const estaSelecionado = pedidoIdSelecionado === item.id;
         const classeSelecionada = estaSelecionado ? ' encomenda-selecionada' : '';
         const prioridade = item.prioridade === 1 || item.prioridade === true;
         const classePrioridade = prioridade ? ' encomenda-prioridade' : '';
-        return `
+        const zebra = idx % 2 === 0 ? ' zebra-impar' : ' zebra-par';
+        html += `
         <tr data-id="${item.id}" 
             data-tipo="P" 
             data-pedido-id="${item.id}"
             data-data-entrega="${item.data_entrega || ''}"
             data-prioridade="${prioridade ? '1' : '0'}"
             draggable="${podeMover ? 'true' : 'false'}"
-            class="encomenda-draggable ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
+            class="encomenda-draggable${zebra} ${!podeMover ? 'visualizacao-only' : ''}${classeSelecionada}${classePrioridade}"
             ondragstart="handleDragStart(event)"
             ondragend="handleDragEnd(event)"
             oncontextmenu="event.preventDefault(); mostrarContextMenu(event, ${item.id}, '${(item.data_entrega || '').replace(/'/g, "\\'")}', ${prioridade ? 'true' : 'false'});">
-            <td>${item.cliente || ''}</td>
-            <td>${item.local_descarga || item.localDescarga || ''}</td>
-            <td>${item.local_carga || item.cliente || ''}</td>
-            <td>${item.material || ''}</td>
-            <td>${item.observacoes || ''}</td>
-        </tr>
-    `;
-    }).join('');
+            <td>${esc(item.cliente)}</td>
+            <td>${esc(item.local_descarga || item.localDescarga)}</td>
+            <td>${esc(item.local_carga || item.cliente)}</td>
+            <td>${esc(item.material)}</td>
+            <td>${esc(item.observacoes)}</td>
+        </tr>`;
+    });
+    tbody.innerHTML = html;
     
     // Reaplicar seleção após renderizar
     if (pedidoIdSelecionado) {
@@ -2520,12 +2559,13 @@ function renderizarViaturasMotoristas(dados) {
         // Usar atribuicao_id se disponível, senão usar id (compatibilidade)
         const cardId = item.atribuicao_id || item.id;
         const atribuicaoId = item.atribuicao_id || null; // Usar atribuicao_id se existir
-        const matriculaDisplay = item.trator_matricula && item.cisterna_matricula 
-            ? `${item.trator_matricula} + ${item.cisterna_matricula}` 
-            : (item.matricula_trator_temp && item.matricula_galera_temp 
-                ? `${item.matricula_trator_temp} + ${item.matricula_galera_temp}` 
-                : (item.matricula_trator_temp ? item.matricula_trator_temp : 
-                    (item.matricula_galera_temp ? item.matricula_galera_temp : item.matricula || '')));
+        // Prioridade: matrícula temporária do dia (alterar matrícula) > conjunto (trator + cisterna) > item.matricula
+        const temMatriculaTemp = item.matricula_trator_temp || item.matricula_galera_temp;
+        const matriculaDisplay = temMatriculaTemp
+            ? [item.matricula_trator_temp, item.matricula_galera_temp].filter(Boolean).join(' + ')
+            : (item.trator_matricula && item.cisterna_matricula
+                ? `${item.trator_matricula} + ${item.cisterna_matricula}`
+                : (item.matricula || ''));
         
         // Se não há atribuicao_id, usar cardId como fallback (para compatibilidade com sistema antigo)
         const idParaUltimoServico = atribuicaoId || cardId;
@@ -2545,8 +2585,48 @@ function renderizarViaturasMotoristas(dados) {
         const iconNoiteFora = foraContinuacao
             ? btnContinuacao
             : (mostraIconeNoiteFora ? `<button type="button" class="btn-noite-fora ${numNoites >= 1 ? 'ativo' : ''} ${numNoites >= 2 ? 'nivel-2' : ''}" onclick="handleNoiteForaClick(${cardId}, '${dataPlaneamento.replace(/'/g, "\\'")}')" oncontextmenu="event.preventDefault(); desmarcarNoiteFora(${cardId}, '${dataPlaneamento.replace(/'/g, "\\'")}')" title="${tituloNoiteFora}">🌙${textoBadgeNoites ? `<span class="btn-noite-fora-badge">${textoBadgeNoites}</span>` : ''}</button>` : '');
+        const horaInicioCedo = (item.hora_inicio_cedo || '').trim() || null;
+        const textoInicioCedo = horaInicioCedo === '05:00' ? '5h' : (horaInicioCedo === '06:00' ? '6h' : '');
+        const temAvariaAlteracao = item.avaria_alteracao === true || item.avaria_alteracao === 1;
+        const avariaObservacao = (item.avaria_observacao || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const avariaObservacaoRaw = (item.avaria_observacao || '').trim();
+        const avariaNotaRaw = (item.avaria_nota || '').trim();
+        const avariaNotaEscaped = (item.avaria_nota || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        const avariaObservacaoDataAttr = avariaObservacaoRaw.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\r/g, '').replace(/\n/g, ' ');
+        const avariaNotaDataAttr = avariaNotaRaw.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\r/g, '').replace(/\n/g, ' ');
+        const tituloBadgeAvaria = (avariaObservacaoRaw ? avariaObservacaoRaw + ' — ' : '') + 'Clique direito para adicionar ou editar nota';
+        const linhaNota = avariaNotaRaw ? `<div class="card-avaria-nota">Nota: ${avariaNotaEscaped}</div>` : '';
+        const badgeAvaria = temAvariaAlteracao ? `<div class="card-avaria-alteracao card-avaria-editavel" data-atribuicao-id="${item.atribuicao_id || cardId}" data-avaria-observacao="${avariaObservacaoDataAttr}" data-avaria-nota="${avariaNotaDataAttr}" title="${tituloBadgeAvaria.replace(/"/g, '&quot;')}" oncontextmenu="event.preventDefault(); event.stopPropagation(); abrirModalAvariaNota(event);">⚠️ Avaria/Alteração${avariaObservacao ? ': ' + avariaObservacao : ''}${linhaNota}</div>` : '';
+        const _nAvaria = parseInt(item.avaria_apos_ordem, 10);
+        const avariaAposOrdem = (item.avaria_apos_ordem != null && !isNaN(_nAvaria) && _nAvaria >= 0) ? _nAvaria : null;
+        const inserirAvariaNoMeio = temAvariaAlteracao && encomendas.length > 0 && avariaAposOrdem != null && avariaAposOrdem > 0 && avariaAposOrdem < encomendas.length;
+        const renderEncomenda = (e, index) => `
+                        <div class="encomenda-card ${(e.prioridade === 1 || e.prioridade === true) ? 'encomenda-prioridade' : ''} ${e.carregado_dia_anterior ? 'encomenda-carregado-dia-anterior' : ''} ${!podeMover ? 'visualizacao-only' : ''}" 
+                             data-pedido-id="${e.pedido_id}"
+                             data-pedido-tipo="${e.pedido_tipo}"
+                             data-viatura-origem-id="${item.id}"
+                             data-atribuicao-id="${e.id}"
+                             data-encomenda-viatura-id="${e.id}"
+                             data-ordem="${e.ordem || index + 1}"
+                             draggable="${podeMover ? 'true' : 'false'}"
+                             ondragstart="handleDragStartBack(event)"
+                             ondragend="handleDragEndBack(event)"
+                             ondragover="handleDragOverEncomenda(event, ${cardId})"
+                             ondragleave="handleDragLeaveEncomenda(event)"
+                             ondrop="handleDropEncomenda(event, ${cardId}, ${e.id})"
+                             oncontextmenu="event.preventDefault(); event.stopPropagation(); mostrarContextMenuEncomendaCarregado(event, ${e.id}, ${e.carregado_dia_anterior ? 'true' : 'false'});"
+                             title="Clique direito: marcar/desmarcar carregado no dia anterior">
+                            <div class="encomenda-conteudo">
+                                <span class="encomenda-texto">${(e.descricao || 'Encomenda ' + e.pedido_id).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>
+                                ${e.observacoes ? `<div class="encomenda-observacoes" style="font-size: 11px; color: #666; margin-top: 4px; font-style: italic;">${(e.observacoes || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
+                            </div>
+                        </div>
+                    `;
+        const blocoEncomendas = inserirAvariaNoMeio
+            ? encomendas.slice(0, avariaAposOrdem).map((e, i) => renderEncomenda(e, i)).join('') + badgeAvaria + encomendas.slice(avariaAposOrdem).map((e, i) => renderEncomenda(e, avariaAposOrdem + i)).join('')
+            : encomendas.map((e, index) => renderEncomenda(e, index)).join('');
         return `
-            <div class="motorista-card ${!podeMover ? 'visualizacao-only' : ''} ${estaDeFerias ? 'ferias-bloqueado' : ''} ${estaDeBaixa ? 'baixa-bloqueado' : ''} ${estaEmOutrosTrabalhos ? 'outros-trabalhos-bloqueado' : ''} ${foraContinuacao ? 'card-fora-continuacao' : ''}" data-id="${cardId}" data-atribuicao-id="${item.atribuicao_id || ''}">
+            <div class="motorista-card ${!podeMover ? 'visualizacao-only' : ''} ${estaDeFerias ? 'ferias-bloqueado' : ''} ${estaDeBaixa ? 'baixa-bloqueado' : ''} ${estaEmOutrosTrabalhos ? 'outros-trabalhos-bloqueado' : ''} ${foraContinuacao ? 'card-fora-continuacao' : ''} ${temAvariaAlteracao ? 'card-tem-avaria' : ''}" data-id="${cardId}" data-atribuicao-id="${item.atribuicao_id || ''}" data-hora-saida="${horaInicioCedo || ''}">
                 <div class="motorista-header">
                     <div class="motorista-info">
                         <div class="motorista-nome" 
@@ -2556,6 +2636,7 @@ function renderizarViaturasMotoristas(dados) {
                              style="cursor: pointer;">PTSA | ${matriculaDisplay}${item.codigo ? ' + ' + item.codigo : ''} - ${item.nome_motorista}</div>
                         ${(statusLower !== 'disponivel' && status !== 'Disponivel' && (item.observacao_status || '').trim()) ? `<div class="motorista-status-observacao" title="Observação do status">${(item.observacao_status || '').trim().replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')}</div>` : ''}
                     </div>
+                    ${textoInicioCedo ? `<span class="badge-hora-saida" title="Hora de saída (clique direito no nome para alterar)">${textoInicioCedo}</span>` : ''}
                     ${iconNoiteFora}
                     <button class="btn-status ${statusClass}" 
                             onclick="abrirModalStatus(${cardId}, '${status.replace(/'/g, "\\'")}', '${(item.observacao_status || '').replace(/'/g, "\\'")}', '${(item.data_inicio || '').replace(/'/g, "\\'")}', '${(item.data_fim || '').replace(/'/g, "\\'")}')"
@@ -2571,26 +2652,10 @@ function renderizarViaturasMotoristas(dados) {
                      ondragover="handleDragOver(event)"
                      ondragenter="handleDragOver(event)"
                      ondragleave="handleDragLeave(event)">
-                    ${encomendas.map((e, index) => `
-                        <div class="encomenda-card ${(e.prioridade === 1 || e.prioridade === true) ? 'encomenda-prioridade' : ''} ${!podeMover ? 'visualizacao-only' : ''}" 
-                             data-pedido-id="${e.pedido_id}"
-                             data-pedido-tipo="${e.pedido_tipo}"
-                             data-viatura-origem-id="${item.id}"
-                             data-atribuicao-id="${e.id}"
-                             data-ordem="${e.ordem || index + 1}"
-                             draggable="${podeMover ? 'true' : 'false'}"
-                             ondragstart="handleDragStartBack(event)"
-                             ondragend="handleDragEndBack(event)"
-                             ondragover="handleDragOverEncomenda(event, ${cardId})"
-                             ondragleave="handleDragLeaveEncomenda(event)"
-                             ondrop="handleDropEncomenda(event, ${cardId}, ${e.id})">
-                            <div class="encomenda-conteudo">
-                                <span class="encomenda-texto">${(e.descricao || 'Encomenda ' + e.pedido_id).replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>
-                                ${e.observacoes ? `<div class="encomenda-observacoes" style="font-size: 11px; color: #666; margin-top: 4px; font-style: italic;">${(e.observacoes || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>` : ''}
-                            </div>
-                        </div>
-                    `).join('')}
+                    ${encomendas.length === 0 ? `<div class="servico-anterior-fundo" data-servico-anterior="pendente"></div>` : ''}
+                    ${blocoEncomendas}
                 </div>
+                ${inserirAvariaNoMeio ? '' : badgeAvaria}
             </div>
         `;
     }).join('');
@@ -2671,6 +2736,9 @@ function renderizarViaturasMotoristas(dados) {
         // Ajustar altura dos cards para caberem todos no ecrã
         ajustarAlturaCards();
     }, 100);
+    
+    // Mostrar, de forma de fundo, o serviço do dia anterior em cada card sem encomendas hoje
+    preencherServicoDiaAnteriorFundo();
 }
 
 // ==================== ADAPTAR COLUNAS DO GRID AO Nº DE CARDS ====================
@@ -2688,12 +2756,13 @@ function aplicarColunasGridCards() {
     }
     
     const containerWidth = colunaViaturas.clientWidth || grid.parentElement.clientWidth || 800;
-    const minColWidth = 308;
-    const gap = 8;
-    const padding = 16;
+    const minColWidth = 200;
+    const gap = 6;
+    const padding = 12;
+    const maxCols = 3; /* no máximo 3 cards por linha */
     const availableWidth = containerWidth - padding;
     const maxColsByWidth = Math.max(1, Math.floor((availableWidth + gap) / (minColWidth + gap)));
-    const numCols = Math.min(cardCount, maxColsByWidth);
+    const numCols = Math.min(maxCols, cardCount, maxColsByWidth);
     
     grid.style.gridTemplateColumns = `repeat(${numCols}, minmax(${minColWidth}px, 1fr))`;
 }
@@ -2742,27 +2811,26 @@ function ajustarAlturaCards() {
     const alturaMinimaCard = 50;
     
     cards.forEach(card => {
-        card.style.height = 'auto';
-        card.style.minHeight = `${alturaMinimaCard}px`;
-        card.style.maxHeight = 'none';
-        card.style.overflow = 'visible';
+        card.style.height = '';
+        card.style.minHeight = '';
+        card.style.maxHeight = '';
+        card.style.overflow = '';
     });
     
-    // Área de encomendas: altura automática pelo conteúdo
     cards.forEach(card => {
         const encomendasArea = card.querySelector('.motorista-encomendas');
         if (encomendasArea) {
-            encomendasArea.style.maxHeight = 'none';
-            encomendasArea.style.overflowY = 'auto';
-            encomendasArea.style.flex = '1 1 auto';
+            encomendasArea.style.maxHeight = '';
+            encomendasArea.style.overflowY = '';
+            encomendasArea.style.flex = '';
         }
     });
     
-    // Limitar altura ao espaço visível e permitir scroll quando há muitos cards
-    grid.style.maxHeight = gridHeight + 'px';
-    grid.style.height = 'auto';
-    grid.style.overflowY = 'auto';
-    grid.style.overflowX = 'hidden';
+    /* Manter grid a preencher a coluna sem scroll (altura vem do CSS: height 100%, grid-auto-rows 1fr) */
+    grid.style.maxHeight = '';
+    grid.style.height = '';
+    grid.style.overflowY = '';
+    grid.style.overflowX = '';
 }
 
 // Ajustar quando a janela é redimensionada
@@ -2892,6 +2960,74 @@ function handleNoiteForaClick(atribuicaoId, dataStr) {
             toggleNoiteFora(atribuicaoId, dataStr);
         }, 400)
     };
+}
+
+function escolherHoraSaida(atribuicaoId) {
+    var id = parseInt(atribuicaoId, 10);
+    if (isNaN(id) || id <= 0) {
+        alert('Erro: atribuição inválida.');
+        return;
+    }
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay-hora-saida';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.4);z-index:9999;display:flex;align-items:center;justify-content:center;';
+    var box = document.createElement('div');
+    box.className = 'modal-hora-saida';
+    box.style.cssText = 'background:#fff;border-radius:8px;padding:20px;box-shadow:0 4px 20px rgba(0,0,0,0.2);min-width:260px;';
+    box.innerHTML = '<div style="margin-bottom:14px;font-weight:600;">Escolha a hora de saída</div>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap;">' +
+        '<button type="button" class="btn-hora-saida-5" style="padding:10px 20px;font-size:16px;cursor:pointer;border:1px solid #ccc;border-radius:6px;background:#f0f8f0;">5h</button>' +
+        '<button type="button" class="btn-hora-saida-6" style="padding:10px 20px;font-size:16px;cursor:pointer;border:1px solid #ccc;border-radius:6px;background:#f0f8f0;">6h</button>' +
+        '<button type="button" class="btn-hora-saida-normal" style="padding:10px 16px;font-size:14px;cursor:pointer;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;">Normal</button>' +
+        '</div>';
+    function fechar() {
+        overlay.remove();
+    }
+    box.querySelector('.btn-hora-saida-5').onclick = function() { fechar(); atualizarInicioCedo(id, '05:00'); };
+    box.querySelector('.btn-hora-saida-6').onclick = function() { fechar(); atualizarInicioCedo(id, '06:00'); };
+    box.querySelector('.btn-hora-saida-normal').onclick = function() { fechar(); atualizarInicioCedo(id, null); };
+    overlay.appendChild(box);
+    overlay.onclick = function(e) { if (e.target === overlay) fechar(); };
+    document.body.appendChild(overlay);
+}
+
+async function atualizarInicioCedo(atribuicaoId, horaInicio) {
+    var val = (horaInicio === '05:00' || horaInicio === '06:00') ? horaInicio : null;
+    var id = parseInt(atribuicaoId, 10);
+    if (isNaN(id) || id <= 0) {
+        alert('Erro: atribuição inválida.');
+        return;
+    }
+    var payload = { atribuicao_id: id, hora_inicio_cedo: val };
+    var url1 = '/api/set-hora-saida';
+    var url2 = '/api/atribuicao/' + id + '/inicio-cedo';
+    var body1 = JSON.stringify(payload);
+    var body2 = JSON.stringify({ hora_inicio_cedo: val });
+    try {
+        var response = await fetch(url1, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body1
+        });
+        if (response.status === 404) {
+            response = await fetch(url2, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: body2
+            });
+        }
+        var result = await response.json().catch(function() { return {}; });
+        if (response.ok && result.success) {
+            if (typeof carregarViaturasMotoristas === 'function') {
+                carregarViaturasMotoristas();
+            }
+        } else {
+            alert(result.error || 'Erro ao definir hora de saída.');
+        }
+    } catch (e) {
+        console.error(e);
+        alert('Erro ao comunicar com o servidor.');
+    }
 }
 
 async function toggleNoiteFora(atribuicaoId, dataStr) {
@@ -3060,6 +3196,19 @@ function fecharModalHistorico() {
 // Variável global para guardar dados originais do histórico
 let dadosHistoricoCompletos = [];
 
+/** Formata a coluna Avaria/Alteração no histórico: identifica avaria e mostra observação e nota. */
+function formatarAvariaHistorico(item) {
+    const temAvaria = item.avaria_alteracao === true || item.avaria_alteracao === 1;
+    const obs = (item.avaria_observacao || '').trim();
+    const nota = (item.avaria_nota || '').trim();
+    if (!temAvaria && !obs && !nota) return '';
+    const partes = [];
+    if (temAvaria) partes.push('⚠️ Avaria/Alteração');
+    if (obs) partes.push('Observação: ' + obs);
+    if (nota) partes.push('Nota: ' + nota);
+    return partes.join(' — ');
+}
+
 async function carregarHistorico() {
     try {
         const dataInicio = document.getElementById('historicoDataInicio').value;
@@ -3079,14 +3228,17 @@ async function carregarHistorico() {
             console.log('DEBUG - Campos do primeiro registro:', Object.keys(dados[0]));
         }
         
-        // Normalizar campos - o servidor pode retornar 'data' e 'local_descarga'
-        // mas o frontend espera 'data_associacao' e 'local_carga'
         const dadosNormalizados = dados.map(item => ({
             data_associacao: item.data_associacao || item.data || '',
             viatura_motorista: item.viatura_motorista || '',
             cliente: item.cliente || '',
-            local_carga: item.local_carga || item.local_descarga || '',
-            material: item.material || ''
+            local_carga: item.local_carga || '',
+            local_descarga: item.local_descarga || '',
+            material: item.material || '',
+            observacoes: item.observacoes || '',
+            avaria_alteracao: item.avaria_alteracao === true || item.avaria_alteracao === 1,
+            avaria_observacao: item.avaria_observacao || '',
+            avaria_nota: item.avaria_nota || ''
         }));
         
         console.log('DEBUG - Dados normalizados:', dadosNormalizados);
@@ -3103,7 +3255,7 @@ async function carregarHistorico() {
         console.error('Erro ao carregar histórico:', error);
         const tbody = document.getElementById('historicoBody');
         if (tbody) {
-            tbody.innerHTML = '<tr><td colspan="5" class="empty">Erro ao carregar histórico</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="empty">Erro ao carregar histórico</td></tr>';
         }
         dadosHistoricoCompletos = [];
     }
@@ -3141,17 +3293,21 @@ function aplicarFiltrosHistorico() {
     
     // Renderizar dados filtrados
     if (dadosFiltrados.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhum resultado encontrado com os filtros aplicados</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" class="empty">Nenhum resultado encontrado com os filtros aplicados</td></tr>';
         return;
     }
     
+    const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     tbody.innerHTML = dadosFiltrados.map(item => `
             <tr>
-                <td>${item.data_associacao || ''}</td>
-                <td>${item.viatura_motorista || ''}</td>
-                <td>${item.cliente || ''}</td>
-                <td>${item.local_carga || ''}</td>
-                <td>${item.material || ''}</td>
+                <td>${esc(item.data_associacao)}</td>
+                <td>${esc(item.viatura_motorista)}</td>
+                <td>${esc(item.cliente)}</td>
+                <td>${esc(item.local_carga)}</td>
+                <td>${esc(item.local_descarga)}</td>
+                <td>${esc(item.material)}</td>
+                <td>${esc(item.observacoes)}</td>
+                <td>${esc(formatarAvariaHistorico(item))}</td>
             </tr>
         `).join('');
 }
@@ -3211,8 +3367,11 @@ async function exportarHistorico() {
                 'Data': item.data_associacao || '',
                 'Viatura/Motorista': item.viatura_motorista || '',
                 'Cliente': item.cliente || '',
-            'Local de Carga': item.local_carga || '',
-                'Material': item.material || ''
+                'Local de Carga': item.local_carga || '',
+                'Local de Descarga': item.local_descarga || '',
+                'Material': item.material || '',
+                'Observações': item.observacoes || '',
+                'Avaria/Alteração': formatarAvariaHistorico(item)
             })));
             
             XLSX.utils.book_append_sheet(wb, ws, 'Histórico');
@@ -4260,6 +4419,76 @@ function pedirCodigoAutorizacao(mensagemErro) {
     });
 }
 
+// ==================== RESUMO DO DIA SEGUINTE (EMAIL OU DESCARREGAR) ====================
+
+function descarregarResumoDia() {
+    const dataInput = document.getElementById('dataPlaneamento');
+    const data = dataInput ? dataInput.value : new Date().toISOString().split('T')[0];
+    if (!data) {
+        alert('Por favor, selecione uma data primeiro.');
+        return;
+    }
+    window.location.href = '/api/resumo-dia-download?data=' + encodeURIComponent(data);
+}
+
+async function enviarResumoDiaEmail() {
+    const dataInput = document.getElementById('dataPlaneamento');
+    const data = dataInput ? dataInput.value : new Date().toISOString().split('T')[0];
+    if (!data) {
+        alert('Por favor, selecione uma data primeiro.');
+        return;
+    }
+    var destinatarios = [];
+    const btn = event && event.target;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ A enviar...';
+    }
+    try {
+        // 1) Tentar envio automático (usa EMAIL_RESUMO_DESTINO do servidor se estiver configurado)
+        var body = { data: data };
+        var response = await fetch('/api/enviar-resumo-dia', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        var result = await response.json().catch(function() { return {}; });
+        if (response.ok && result.success) {
+            alert(result.message || 'Resumo do dia seguinte enviado por email com sucesso.');
+            return;
+        }
+        if (response.status === 400 && result.error && result.error.indexOf('Nenhum destinatário') !== -1) {
+            var emailsStr = prompt('Indique o(s) email(s) destinatário(s), separados por vírgula:', '');
+            if (emailsStr === null) { return; }
+            destinatarios = emailsStr.split(/[,;]/).map(function(e) { return e.trim(); }).filter(Boolean);
+            if (destinatarios.length === 0) {
+                alert('Tem de indicar pelo menos um email destinatário.');
+                return;
+            }
+            body.destinatarios = destinatarios;
+            response = await fetch('/api/enviar-resumo-dia', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            result = await response.json().catch(function() { return {}; });
+        }
+        if (response.ok && result.success) {
+            alert(result.message || 'Resumo do dia seguinte enviado por email com sucesso.');
+            return;
+        }
+        alert('Erro ao enviar resumo: ' + (result.error || response.statusText || 'Erro desconhecido'));
+    } catch (err) {
+        console.error(err);
+        alert('Erro ao enviar resumo: ' + (err.message || 'Sem ligação ao servidor'));
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '📧 Resumo por email';
+        }
+    }
+}
+
 // ==================== ENVIAR PARA WIALONG ====================
 
 async function enviarParaWialong() {
@@ -4525,6 +4754,248 @@ function mostrarContextMenuPlaneamento(event, planeamentoId) {
     // Implementar menu de contexto se necessário
 }
 
+// Estado do modal de avaria (para poder guardar depois de o utilizador escrever a observação)
+let avariaModalAtribuicaoId = null;
+let avariaModalMarcar = false;
+
+function abrirModalAvaria(atribuicaoId, marcar) {
+    try {
+        const menu = document.getElementById('contextMenuMotorista');
+        if (menu) menu.remove();
+        avariaModalAtribuicaoId = parseInt(atribuicaoId, 10);
+        avariaModalMarcar = !!marcar;
+        const modal = document.getElementById('avariaModal');
+        if (modal) {
+            modal.style.display = 'block';
+            modal.style.visibility = 'visible';
+            modal.style.zIndex = '10000';
+            const input = document.getElementById('avariaObservacaoInput');
+            if (input) {
+                input.value = '';
+                setTimeout(function() { input.focus(); }, 50);
+            }
+            return;
+        }
+        // Fallback se o modal não existir no DOM (ex.: cache antigo)
+        const observacao = prompt('Observação (opcional) - ex.: atrelou outro trator, avaria a meio do serviço.', '') || '';
+        if (observacao !== null) {
+            guardarAvariaObservacaoComValores(atribuicaoId, true, observacao);
+        }
+    } catch (e) {
+        console.error('abrirModalAvaria:', e);
+        alert('Erro ao abrir o formulário de avaria. Tente recarregar a página.');
+    }
+}
+
+function fecharModalAvaria() {
+    avariaModalAtribuicaoId = null;
+    avariaModalMarcar = false;
+    const input = document.getElementById('avariaObservacaoInput');
+    if (input) input.value = '';
+    const modal = document.getElementById('avariaModal');
+    if (modal) {
+        modal.style.display = 'none';
+        modal.style.zIndex = '';
+    }
+}
+
+// Estado do modal da NOTA da avaria (observação não se altera, só a nota)
+let avariaNotaModalAtribuicaoId = null;
+let avariaNotaModalObservacao = '';
+
+/** Clique direito no badge da avaria: abre o modal para adicionar ou editar a NOTA (a observação fica só de leitura). */
+function abrirModalAvariaNota(event) {
+    const badge = event.target && event.target.classList && event.target.classList.contains('card-avaria-alteracao')
+        ? event.target
+        : (event.target && event.target.closest ? event.target.closest('.card-avaria-alteracao') : null);
+    if (!badge) return;
+    const atribuicaoId = badge.getAttribute('data-atribuicao-id');
+    const observacaoAtual = badge.getAttribute('data-avaria-observacao') || '';
+    const notaAtual = badge.getAttribute('data-avaria-nota') || '';
+    if (!atribuicaoId) return;
+    avariaNotaModalAtribuicaoId = parseInt(atribuicaoId, 10);
+    avariaNotaModalObservacao = observacaoAtual;
+    const elObservacao = document.getElementById('avariaNotaModalObservacao');
+    if (elObservacao) elObservacao.textContent = observacaoAtual || '(sem observação)';
+    const inputNota = document.getElementById('avariaNotaInput');
+    if (inputNota) {
+        inputNota.value = notaAtual;
+        inputNota.focus();
+    }
+    const modal = document.getElementById('avariaNotaModal');
+    if (modal) {
+        modal.style.display = 'block';
+        modal.style.visibility = 'visible';
+        modal.style.zIndex = '10000';
+        setTimeout(function() { if (inputNota) inputNota.focus(); }, 50);
+    }
+}
+
+function fecharModalAvariaNota() {
+    avariaNotaModalAtribuicaoId = null;
+    avariaNotaModalObservacao = '';
+    const input = document.getElementById('avariaNotaInput');
+    if (input) input.value = '';
+    const modal = document.getElementById('avariaNotaModal');
+    if (modal) { modal.style.display = 'none'; modal.style.zIndex = ''; }
+}
+
+async function guardarAvariaNota() {
+    const id = avariaNotaModalAtribuicaoId;
+    if (id == null || isNaN(id) || id <= 0) { fecharModalAvariaNota(); return; }
+    const inputNota = document.getElementById('avariaNotaInput');
+    const nota = (inputNota && inputNota.value) ? inputNota.value.trim() : '';
+    fecharModalAvariaNota();
+    const body = JSON.stringify({ avaria: true, avaria_observacao: avariaNotaModalObservacao, avaria_nota: nota });
+    const urls = [`/api/atribuicao/${id}/avaria`, `/api/atribuicoes-motoristas/${id}/avaria`];
+    for (const url of urls) {
+        try {
+            const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: body });
+            const data = await response.json().catch(() => ({}));
+            if (response.status === 404) continue;
+            if (!response.ok) { alert(data.error || 'Erro ao atualizar.'); return; }
+            await carregarViaturasMotoristas();
+            return;
+        } catch (e) { if (e.name !== 'TypeError') console.error(e); }
+    }
+    alert('Endpoint de avaria não encontrado.');
+}
+
+// Expor para onclick/oncontextmenu no HTML
+if (typeof window !== 'undefined') {
+    window.abrirModalAvaria = abrirModalAvaria;
+    window.fecharModalAvaria = fecharModalAvaria;
+    window.guardarAvariaObservacao = guardarAvariaObservacao;
+    window.abrirModalAvariaNota = abrirModalAvariaNota;
+    window.fecharModalAvariaNota = fecharModalAvariaNota;
+    window.guardarAvariaNota = guardarAvariaNota;
+}
+
+async function guardarAvariaObservacaoComValores(id, marcar, observacao) {
+    const idNum = parseInt(id, 10);
+    if (isNaN(idNum) || idNum <= 0) return;
+    const body = JSON.stringify({ avaria: !!marcar, avaria_observacao: (observacao || '').trim() });
+    const urls = [`/api/atribuicao/${idNum}/avaria`, `/api/atribuicoes-motoristas/${idNum}/avaria`];
+    for (const url of urls) {
+        try {
+            const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: body });
+            const data = await response.json().catch(() => ({}));
+            if (response.status === 404) continue;
+            if (!response.ok) {
+                alert(data.error || 'Erro ao atualizar.');
+                return;
+            }
+            await carregarViaturasMotoristas();
+            return;
+        } catch (e) {
+            if (e.name !== 'TypeError') console.error(e);
+        }
+    }
+    alert('Endpoint de avaria não encontrado. Pare o servidor (Ctrl+C) e volte a executar: python app.py');
+}
+
+async function guardarAvariaObservacao() {
+    const id = avariaModalAtribuicaoId;
+    const marcar = avariaModalMarcar;
+    if (id == null || isNaN(id) || id <= 0) {
+        fecharModalAvaria();
+        return;
+    }
+    const input = document.getElementById('avariaObservacaoInput');
+    const observacao = (input && input.value) ? input.value.trim() : '';
+    fecharModalAvaria();
+    await guardarAvariaObservacaoComValores(id, marcar, observacao);
+}
+
+async function marcarAvariaAtribuicao(atribuicaoId, marcar) {
+    const id = parseInt(atribuicaoId, 10);
+    if (isNaN(id) || id <= 0) {
+        alert('ID do card inválido. Tente recarregar a página.');
+        return;
+    }
+    if (marcar) {
+        abrirModalAvaria(atribuicaoId, true);
+        return;
+    }
+    // Remover avaria: sem observação, chamar API diretamente
+    const body = JSON.stringify({ avaria: false, avaria_observacao: '' });
+    const urls = [`/api/atribuicao/${id}/avaria`, `/api/atribuicoes-motoristas/${id}/avaria`];
+    for (const url of urls) {
+        try {
+            const response = await fetch(url, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: body
+            });
+            const data = await response.json().catch(() => ({}));
+            if (response.status === 404) continue;
+            if (!response.ok) {
+                alert(data.error || 'Erro ao atualizar.');
+                return;
+            }
+            await carregarViaturasMotoristas();
+            return;
+        } catch (e) {
+            if (e.name !== 'TypeError') console.error(e);
+        }
+    }
+    alert('Endpoint de avaria não encontrado. Pare o servidor (Ctrl+C) e volte a executar: python app.py');
+}
+
+async function toggleEncomendaCarregadoDiaAnterior(encomendaViaturaId, marcar) {
+    try {
+        const response = await fetch('/api/encomenda-carregado-dia-anterior', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ encomenda_viatura_id: encomendaViaturaId, marcar })
+        });
+        const result = await response.json();
+        if (result.success) {
+            await carregarViaturasMotoristas();
+        } else {
+            alert(result.error || 'Erro ao atualizar.');
+        }
+    } catch (e) {
+        console.error(e);
+        alert('Erro ao marcar/desmarcar carregado no dia anterior.');
+    }
+}
+
+function mostrarContextMenuEncomendaCarregado(event, encomendaViaturaId, estaMarcado) {
+    event.preventDefault();
+    event.stopPropagation();
+    const menuAnterior = document.getElementById('contextMenuEncomendaCarregado');
+    if (menuAnterior) menuAnterior.remove();
+    const isMarcado = (estaMarcado === true || estaMarcado === 'true');
+    const menu = document.createElement('div');
+    menu.id = 'contextMenuEncomendaCarregado';
+    menu.className = 'context-menu';
+    menu.style.cssText = 'position: fixed; background: white; border: 1px solid #ccc; border-radius: 4px; box-shadow: 0 2px 10px rgba(0,0,0,0.2); z-index: 10000; padding: 5px 0; min-width: 220px;';
+    const texto = isMarcado ? 'Desmarcar carregado no dia anterior' : 'Carregou no dia anterior';
+    const item = document.createElement('div');
+    item.className = 'context-menu-item';
+    item.textContent = '🚛 ' + texto;
+    item.style.cssText = 'padding: 8px 15px; cursor: pointer; font-size: 14px;';
+    item.onmouseover = function() { this.style.backgroundColor = '#f0f0f0'; };
+    item.onmouseout = function() { this.style.backgroundColor = 'transparent'; };
+    item.onclick = function() {
+        menu.remove();
+        const id = parseInt(encomendaViaturaId, 10);
+        if (!isNaN(id)) toggleEncomendaCarregadoDiaAnterior(id, !isMarcado);
+    };
+    menu.appendChild(item);
+    menu.style.left = event.clientX + 'px';
+    menu.style.top = event.clientY + 'px';
+    document.body.appendChild(menu);
+    const fechar = (e) => {
+        if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('click', fechar); document.removeEventListener('contextmenu', fechar); }
+    };
+    setTimeout(() => {
+        document.addEventListener('click', fechar, { once: true });
+        document.addEventListener('contextmenu', fechar, { once: true });
+    }, 100);
+}
+
 function mostrarContextMenuMotorista(event, viaturaId, nomeMotorista, matricula) {
     event.preventDefault();
     event.stopPropagation();
@@ -4550,9 +5021,16 @@ function mostrarContextMenuMotorista(event, viaturaId, nomeMotorista, matricula)
         min-width: 200px;
     `;
     
-    // Opções do menu
+    // Verificar se este card tem avaria marcada (atribuicao_id = viaturaId nos cards de planeamento)
+    const cardEl = document.querySelector(`.motorista-card[data-id="${viaturaId}"]`);
+    const temAvaria = cardEl && cardEl.classList.contains('card-tem-avaria');
+    const atribuicaoId = cardEl ? (parseInt(cardEl.getAttribute('data-atribuicao-id'), 10) || viaturaId) : viaturaId;
     const opcoes = [
         { texto: '✏️ Alterar Matrícula', acao: () => verificarEAbrirModalAlterarMatricula(viaturaId, matricula, nomeMotorista) },
+        temAvaria
+            ? { texto: '✅ Remover avaria/alteração', acao: () => marcarAvariaAtribuicao(viaturaId, false) }
+            : { texto: '⚠️ Marcar avaria/alteração', acao: () => marcarAvariaAtribuicao(viaturaId, true) },
+        { texto: '⏰ Hora de saída', acao: () => escolherHoraSaida(atribuicaoId) },
         { texto: '🗑️ Apagar Card', acao: () => confirmarApagarCardPermanente(viaturaId, nomeMotorista, matricula) }
     ];
     
@@ -4570,17 +5048,18 @@ function mostrarContextMenuMotorista(event, viaturaId, nomeMotorista, matricula)
         item.onclick = function(e) {
             e.stopPropagation();
             e.preventDefault();
-            console.log('Menu item clicado:', opcao.texto);
+            const acao = opcao.acao;
+            const texto = opcao.texto;
             menu.remove();
-            // Chamar a ação após um pequeno delay para garantir que o menu foi removido
+            // Chamar a ação após um pequeno delay para garantir que o menu foi removido e o clique terminou
             setTimeout(() => {
                 try {
-                    opcao.acao();
+                    acao();
                 } catch (error) {
                     console.error('Erro ao executar ação do menu:', error);
                     alert('Erro: ' + error.message);
                 }
-            }, 10);
+            }, 50);
         };
         menu.appendChild(item);
     });
@@ -5926,6 +6405,52 @@ async function mostrarServicoDiaAnterior(viaturaId, nomeMotorista, matricula) {
     }
 }
 
+// Preencher, em fundo, o serviço do dia anterior dentro dos cards (sem encomendas hoje)
+async function preencherServicoDiaAnteriorFundo() {
+    try {
+        const dataInput = document.getElementById('dataPlaneamento');
+        if (!dataInput || !dataInput.value) return;
+        const dataSelecionadaStr = dataInput.value;
+        
+        const zonas = Array.from(document.querySelectorAll('.motorista-encomendas[data-viatura-id]'));
+        if (zonas.length === 0) return;
+        
+        await Promise.all(zonas.map(async (zona) => {
+            // Se já tem encomendas hoje, não mostrar serviço de ontem
+            if (zona.querySelector('.encomenda-card')) return;
+            
+            const fundo = zona.querySelector('.servico-anterior-fundo');
+            if (!fundo) return;
+            
+            const viaturaId = parseInt(zona.getAttribute('data-viatura-id'));
+            if (!viaturaId || isNaN(viaturaId)) return;
+
+            try {
+                // data-viatura-id nos cards é atribuicao_id (conjunto do dia). Último serviço por atribuição/conjunto.
+                const response = await fetch(`/api/atribuicao/${viaturaId}/ultimo-servico?data_ref=${encodeURIComponent(dataSelecionadaStr)}`);
+                if (!response.ok) return;
+                
+                const dados = await response.json();
+                if (!dados || !Array.isArray(dados.encomendas) || dados.encomendas.length === 0) {
+                    fundo.textContent = '';
+                    return;
+                }
+                
+                const linhas = dados.encomendas.map((item, idx) => {
+                    const texto = (item.local_descarga || item.local_carga || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    return `${idx + 1}) ${texto || '—'}`;
+                });
+                
+                fundo.innerHTML = linhas.join('<br>');
+            } catch (e) {
+                console.error('Erro ao preencher serviço do dia anterior no card:', e);
+            }
+        }));
+    } catch (error) {
+        console.error('Erro em preencherServicoDiaAnteriorFundo:', error);
+    }
+}
+
 function fecharModalServicoDiaAnterior() {
     document.getElementById('servicoDiaAnteriorModal').style.display = 'none';
 }
@@ -6008,16 +6533,17 @@ async function mostrarUltimoServicoAtribuicao(atribuicaoId, nomeMotorista, matri
         return;
     }
     
-    // Atualizar título
-    titulo.textContent = `📋 Último Serviço - ${nomeMotorista} (${matricula})`;
+    titulo.textContent = `📋 Último dia com trabalho - ${nomeMotorista} (${matricula})`;
     info.textContent = 'Carregando...';
-    tbody.innerHTML = '<tr><td colspan="3" class="loading">Carregando último serviço...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="loading">Carregando último serviço...</td></tr>';
     
-    // Mostrar modal
     modal.style.display = 'block';
     
+    const dataPlaneamento = (document.getElementById('dataPlaneamento') && document.getElementById('dataPlaneamento').value) || new Date().toISOString().split('T')[0];
+    const url = `/api/atribuicao/${atribuicaoId}/ultimo-servico?data_ref=${encodeURIComponent(dataPlaneamento)}&ultimo_dia_com_servico=1`;
+    
     try {
-        const response = await fetch(`/api/atribuicao/${atribuicaoId}/ultimo-servico`);
+        const response = await fetch(url);
         
         if (!response.ok) {
             throw new Error(`Erro ${response.status}: ${response.statusText}`);
@@ -6030,12 +6556,11 @@ async function mostrarUltimoServicoAtribuicao(atribuicaoId, nomeMotorista, matri
         }
         
         if (!dados.data || !dados.encomendas || dados.encomendas.length === 0) {
-            info.textContent = 'Nenhum serviço anterior encontrado';
-            tbody.innerHTML = '<tr><td colspan="3" class="empty">Nenhum serviço anterior encontrado</td></tr>';
+            info.textContent = 'Nenhum serviço no último dia com trabalho';
+            tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhum serviço no último dia com trabalho</td></tr>';
             return;
         }
         
-        // Formatar data
         const dataObj = new Date(dados.data + 'T00:00:00');
         const dataFormatada = dataObj.toLocaleDateString('pt-PT', { 
             weekday: 'long', 
@@ -6046,12 +6571,12 @@ async function mostrarUltimoServicoAtribuicao(atribuicaoId, nomeMotorista, matri
         
         info.textContent = `Data: ${dataFormatada}`;
         
-        // Preencher tabela
         tbody.innerHTML = dados.encomendas.map((e, index) => `
             <tr>
                 <td>${index + 1}</td>
                 <td>${(e.local_carga || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
                 <td>${(e.cliente || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
+                <td>${(e.local_descarga || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
                 <td>${(e.material || '').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
             </tr>
         `).join('');
@@ -6059,7 +6584,7 @@ async function mostrarUltimoServicoAtribuicao(atribuicaoId, nomeMotorista, matri
     } catch (error) {
         console.error('Erro ao carregar último serviço:', error);
         info.textContent = 'Erro ao carregar último serviço';
-        tbody.innerHTML = `<tr><td colspan="3" class="error">Erro: ${error.message}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="error">Erro: ${error.message}</td></tr>`;
     }
 }
 
@@ -6573,13 +7098,13 @@ async function carregarHistoricoAlteracoes() {
         const tbody = document.getElementById('historicoAlteracoesBody');
         if (!tbody) return;
         
-        tbody.innerHTML = '<tr><td colspan="5" class="loading">Carregando histórico de alterações...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="loading">Carregando histórico de alterações...</td></tr>';
         
         const response = await fetch('/api/historico-alteracoes');
         const dados = await response.json();
         
         if (!dados || dados.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" class="empty">Nenhuma alteração registada</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="6" class="empty">Nenhuma alteração registada</td></tr>';
             return;
         }
         
@@ -6592,7 +7117,9 @@ async function carregarHistoricoAlteracoes() {
             'MOVER_ENCOMENDA',
             'ALTERAR_DATA_PEDIDO',
             'ATRIBUIR_ENCOMENDA',
-            'REMOVER_ATRIBUICAO'
+            'REMOVER_ATRIBUICAO',
+            'DISPONIBILIDADE_FORCADA',
+            'DESATIVAR_CARD_DATA_ATUAL'
         ];
         
         tbody.innerHTML = dados.map(item => {
@@ -6614,6 +7141,10 @@ async function carregarHistoricoAlteracoes() {
                 mensagemConfirmacao = 'Tem certeza que deseja reverter esta alteração? A data será restaurada.';
             } else if (item.tipo_acao === 'ATRIBUIR_ENCOMENDA' || item.tipo_acao === 'REMOVER_ATRIBUICAO') {
                 mensagemConfirmacao = 'Tem certeza que deseja reverter esta alteração? A atribuição será revertida.';
+            } else if (item.tipo_acao === 'DISPONIBILIDADE_FORCADA') {
+                mensagemConfirmacao = 'Tem certeza que deseja reverter? O status anterior (Férias/Baixa/Outros trabalhos) será reposto.';
+            } else if (item.tipo_acao === 'DESATIVAR_CARD_DATA_ATUAL') {
+                mensagemConfirmacao = 'Tem certeza que deseja reverter? O card será reativado e as encomendas repostas.';
             }
             
             // Escapar a mensagem para uso seguro em HTML/JavaScript
@@ -6622,6 +7153,7 @@ async function carregarHistoricoAlteracoes() {
                 .replace(/"/g, '&quot;')
                 .replace(/\n/g, ' ');
             
+            const userNome = item.user_nome || '—';
             return `
                 <tr>
                     <td style="color: #333;">
@@ -6632,6 +7164,7 @@ async function carregarHistoricoAlteracoes() {
                     <td style="color: #333;">${dataAcao}</td>
                     <td style="color: #333;">${item.tipo_acao}</td>
                     <td style="color: #333;">${item.descricao}</td>
+                    <td style="color: #333;">${userNome}</td>
                     <td style="color: ${corStatus}; font-weight: bold;">${revertido}</td>
                 </tr>
             `;
@@ -6963,6 +7496,23 @@ function atualizarGraficoClientes(dados) {
     const ctx = document.getElementById('graficoClientes');
     if (!ctx) return;
     
+    if (!dados || dados.length === 0) {
+        if (graficosAnalises.clientes) {
+            graficosAnalises.clientes.destroy();
+            graficosAnalises.clientes = null;
+        }
+        const tbody = document.getElementById('tabelaClientesBody');
+        if (tbody) tbody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: #666;">Nenhum dado no período selecionado</td></tr>';
+        return;
+    }
+    
+    const totalGeral = dados.reduce((s, d) => s + (Number(d.total) || 0), 0);
+    const dadosComPerc = dados.map(d => {
+        const total = Number(d.total) || 0;
+        const perc = totalGeral > 0 ? (100 * total / totalGeral) : 0;
+        return { ...d, total, percentagem: perc };
+    });
+    
     if (graficosAnalises.clientes) {
         graficosAnalises.clientes.destroy();
     }
@@ -6970,9 +7520,9 @@ function atualizarGraficoClientes(dados) {
     graficosAnalises.clientes = new Chart(ctx, {
         type: 'doughnut',
         data: {
-            labels: dados.map(d => d.cliente),
+            labels: dadosComPerc.map(d => `${d.cliente} (${d.percentagem.toFixed(1)}%)`),
             datasets: [{
-                data: dados.map(d => d.total),
+                data: dadosComPerc.map(d => d.total),
                 backgroundColor: [
                     'rgba(255, 99, 132, 0.6)',
                     'rgba(54, 162, 235, 0.6)',
@@ -6993,10 +7543,27 @@ function atualizarGraficoClientes(dados) {
                 },
                 legend: {
                     position: 'right'
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            const total = context.parsed;
+                            const pct = totalGeral > 0 ? (100 * total / totalGeral).toFixed(1) : '0';
+                            return `${context.label.replace(/ \(\d+\.?\d*%\)$/, '')}: ${total} (${pct}%)`;
+                        }
+                    }
                 }
             }
         }
     });
+    
+    const tbody = document.getElementById('tabelaClientesBody');
+    if (tbody) {
+        const escape = (s) => String(s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        tbody.innerHTML = dadosComPerc.map(d => 
+            `<tr><td style="padding: 8px;">${escape(d.cliente)}</td><td style="padding: 8px; text-align: right;">${d.total}</td><td style="padding: 8px; text-align: right;">${d.percentagem.toFixed(1)}%</td></tr>`
+        ).join('');
+    }
 }
 
 function atualizarNoiteFora(dados) {

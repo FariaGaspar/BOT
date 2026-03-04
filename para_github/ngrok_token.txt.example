@@ -1,0 +1,10 @@
+COLOQUE_AQUI_O_SEU_TOKEN_NGROK
+
+Instruções:
+1. Aceda a https://dashboard.ngrok.com/get-started/your-authtoken (crie conta grátis se necessário)
+2. Copie o "Your Authtoken"
+3. Renomeie este ficheiro para: ngrok_token.txt
+4. Substitua a linha acima pelo token (apenas o token, nada mais)
+5. Reinicie o servidor da aplicação
+
+O ficheiro ngrok_token.txt não deve ser partilhado (contém a sua chave pessoal).

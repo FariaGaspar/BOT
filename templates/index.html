@@ -53,10 +53,12 @@
                 <h1 style="margin: 0; font-size: 24px; font-weight: bold; color: #ff6600; justify-self: start;">Pragosa Logistics</h1>
                 <div style="display: flex; gap: 8px; align-items: center; justify-self: center;">
                     <input type="date" id="dataPlaneamento" value="{{ data_atual }}" style="padding: 6px; border: 1px solid #ddd; border-radius: 4px; font-size: 12px;">
+                    <button type="button" onclick="atualizarDadosSemMudarData()" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" title="Atualizar dados da data atual sem alterar a data">🔄 Atualizar</button>
                     <button onclick="adicionarPedido('pendente')" class="btn btn-primary" style="padding: 6px 12px; font-size: 12px;">+ Adicionar Cargas</button>
                     <button onclick="enviarParaWialong()" class="btn btn-success" style="padding: 6px 12px; font-size: 12px;">📤 Enviar Wialong</button>
                     <button onclick="abrirModalHistorico()" class="btn btn-info" style="padding: 6px 12px; font-size: 12px;">📊 Histórico</button>
                     <button onclick="abrirModalAnalises()" class="btn btn-warning" style="padding: 6px 12px; font-size: 12px;">📈 Análises</button>
+                    <button onclick="enviarResumoDiaEmail()" class="btn btn-secondary" style="padding: 6px 12px; font-size: 12px;" title="Enviar resumo do dia seguinte por email para joao.gaspar@pragosa.pt">📧 Resumo por email</button>
                 </div>
                 <div style="display: flex; gap: 8px; align-items: center; justify-self: end;">
                     <div id="indicadorVisualizacao"></div>
@@ -582,13 +584,16 @@
                             <th>Data</th>
                             <th>Viatura/Motorista</th>
                             <th>Cliente</th>
-                                    <th>Local de Carga</th>
+                            <th>Local de Carga</th>
+                            <th>Local de Descarga</th>
                             <th>Material</th>
+                            <th>Observações</th>
+                            <th>Avaria/Alteração</th>
                         </tr>
                     </thead>
                     <tbody id="historicoBody">
                         <tr>
-                            <td colspan="5" class="loading">Carregando histórico...</td>
+                            <td colspan="7" class="loading">Carregando histórico...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -690,14 +695,16 @@
                 <table>
                     <thead>
                         <tr>
-                                    <th>Local de Carga</th>
+                            <th>#</th>
+                            <th>Local de Carga</th>
                             <th>Cliente</th>
+                            <th>Local de Descarga</th>
                             <th>Material</th>
                         </tr>
                     </thead>
                     <tbody id="ultimoServicoBody">
                         <tr>
-                            <td colspan="3" class="loading">Carregando...</td>
+                            <td colspan="5" class="loading">Carregando...</td>
                         </tr>
                     </tbody>
                 </table>
@@ -746,6 +753,46 @@
                     <button type="button" onclick="fecharModalAlterarData()" class="btn btn-secondary">Cancelar</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Modal para observação da avaria/alteração -->
+    <div id="avariaModal" class="modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <span class="close" onclick="fecharModalAvaria()">&times;</span>
+            <h2>⚠️ Avaria / Alteração de Serviço</h2>
+            <p style="color: #666; margin-bottom: 12px;">Indique o que aconteceu (ex.: atrelou outro trator, avaria a meio do serviço). Esta nota fica registada no histórico e não apaga o serviço já feito.</p>
+            <div class="form-group">
+                <label for="avariaObservacaoInput">Observação:</label>
+                <textarea id="avariaObservacaoInput" rows="4" placeholder="Ex.: Atrelou outro trator para concluir os serviços..."
+                          style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; resize: vertical; box-sizing: border-box;"></textarea>
+            </div>
+            <div class="form-actions" style="margin-top: 16px;">
+                <button type="button" onclick="guardarAvariaObservacao()" class="btn btn-primary">Guardar</button>
+                <button type="button" onclick="fecharModalAvaria()" class="btn btn-secondary">Cancelar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal para adicionar/editar NOTA da avaria (a observação não se altera) -->
+    <div id="avariaNotaModal" class="modal">
+        <div class="modal-content" style="max-width: 480px;">
+            <span class="close" onclick="fecharModalAvariaNota()">&times;</span>
+            <h2>📝 Nota da Avaria / Alteração</h2>
+            <p style="color: #666; margin-bottom: 12px;">Pode acrescentar uma nota à observação já registada. A observação original mantém-se.</p>
+            <div class="form-group">
+                <label>Observação (actual):</label>
+                <div id="avariaNotaModalObservacao" style="padding: 10px; background: #f5f5f5; border-radius: 4px; font-size: 14px; color: #333; min-height: 40px;"></div>
+            </div>
+            <div class="form-group">
+                <label for="avariaNotaInput">Nota / Anotação:</label>
+                <textarea id="avariaNotaInput" rows="3" placeholder="Ex.: Resolvido no dia seguinte, confirmado pelo João..."
+                          style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; resize: vertical; box-sizing: border-box;"></textarea>
+            </div>
+            <div class="form-actions" style="margin-top: 16px;">
+                <button type="button" onclick="guardarAvariaNota()" class="btn btn-primary">Guardar</button>
+                <button type="button" onclick="fecharModalAvariaNota()" class="btn btn-secondary">Cancelar</button>
+            </div>
         </div>
     </div>
 
@@ -1068,12 +1115,13 @@
                                 <th>Data/Hora</th>
                                 <th>Tipo de Ação</th>
                                 <th>Descrição</th>
+                                <th>Utilizador</th>
                                 <th>Status</th>
                             </tr>
                         </thead>
                         <tbody id="historicoAlteracoesBody">
                             <tr>
-                                <td colspan="5" class="loading">Carregando histórico de alterações...</td>
+                                <td colspan="6" class="loading">Carregando histórico de alterações...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -1254,6 +1302,16 @@
             <div id="analiseClientes" class="analise-content" style="display: none;">
                 <h3>🏢 Análise por Cliente</h3>
                 <canvas id="graficoClientes" style="max-height: 400px;"></canvas>
+                <div style="margin-top: 20px; overflow-x: auto;">
+                    <table class="table table-bordered" style="width: 100%; max-width: 600px;">
+                        <thead>
+                            <tr><th>Cliente</th><th>Total</th><th>%</th></tr>
+                        </thead>
+                        <tbody id="tabelaClientesBody">
+                            <tr><td colspan="3" style="text-align: center; color: #666;">Carregue as análises para ver os dados</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
 
             <div id="analiseMateriais" class="analise-content" style="display: none;">

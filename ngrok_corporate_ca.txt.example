@@ -1,0 +1,18 @@
+Como usar ngrok atrás de proxy corporativo (erro x509 / korgn.su.lennut.com)
+================================================================================
+
+Opção A – Cloudflare Tunnel (recomendado, sem configurar certificados)
+  Se o ngrok falhar, o servidor tenta automaticamente o Cloudflare Tunnel.
+  Instale o cloudflared e coloque no PATH (ou na pasta do projeto):
+  https://github.com/cloudflare/cloudflared/releases
+  Depois reinicie o servidor. Deve aparecer "URL Pública (Internet): https://....trycloudflare.com"
+
+Opção B – Certificado CA do proxy (para ngrok funcionar na rede corporativa)
+  1. Exportar o certificado raiz do proxy no Windows:
+     - Executar certmgr.msc
+     - Expandir "Autoridades de Certificação Raiz Fidedignas"
+     - Encontrar o certificado da empresa (ex.: "Lennut" ou nome do proxy)
+     - Clique direito > Todas as tarefas > Exportar
+     - Seguinte > Não exportar a chave privada > Formato Base64 X.509 (.CER)
+     - Guardar como ngrok_corporate_ca.pem na pasta do projeto
+  2. Reiniciar o servidor. O ngrok usará esse CA para validar a ligação ao proxy.

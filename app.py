@@ -2,6 +2,15 @@
 Servidor Web para Sistema de Planeamento de Cargas
 Migrado do Excel/VBA para Flask
 """
+# Carregar .env (DATABASE_URL, SMTP, etc.) – pasta do app e diretório atual
+import os as _os
+try:
+    from dotenv import load_dotenv
+    _app_dir = _os.path.dirname(_os.path.abspath(__file__))
+    load_dotenv(_os.path.join(_app_dir, '.env'))
+    load_dotenv()  # cwd
+except ImportError:
+    pass
 from flask import Flask, render_template, request, jsonify, send_from_directory, send_file, make_response
 from flask_cors import CORS
 import sqlite3
@@ -37,16 +46,15 @@ app = Flask(__name__,
     static_folder=_STATIC_DIR,
     static_url_path='/static')
 CORS(app)
-# Quando atrás de túnel (Cloudflare/ngrok), usar X-Forwarded-* para URLs e redirects corretos
+# Quando atrás de proxy reverso (ex.: rede corporativa), usar X-Forwarded-* para URLs corretas
 try:
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 except ImportError:
     pass
 
-# URL pública do túnel (ngrok/Cloudflare) — atualizada no arranque e na thread do Cloudflare
+# Aplicação apenas na rede local ou via VPN (sem túneis para a internet)
 app.config['URL_PUBLICA'] = None
-# IP Tailscale (para contornar rede corporativa) — definido no arranque
 app.config['TAILSCALE_IP'] = None
 
 # ========== SERVER SECRET (muda a cada reinício do servidor) ==========
@@ -187,8 +195,8 @@ def _html_erro_templates(exc):
 @app.before_request
 def track_request():
     """Rastrear todas as requisições"""
-    # Ignorar requisições para login, logout, túnel de teste, QR telemóvel, acesso remoto, estáticos e admin
-    if request.path in ['/login', '/health', '/favicon.ico', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/tunnel-ok', '/qr', '/acesso-remoto'] or \
+    # Ignorar requisições para login, logout, página de acesso (rede/VPN), estáticos e admin
+    if request.path in ['/login', '/health', '/favicon.ico', '/api/login', '/api/auth/check', '/api/logout', '/api/utilizadores-login', '/link', '/diagnostico', '/partilha'] or \
        request.path.startswith('/static/') or \
        request.path.startswith('/admin/'):
         return
@@ -242,11 +250,74 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE = os.path.join(BASE_DIR, 'planeamento.db')
 UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
 
+# Base de dados na nuvem (PostgreSQL): quando definido, PC e Render usam os mesmos dados
+DATABASE_URL = os.environ.get('DATABASE_URL')
+_using_pg = bool(DATABASE_URL)
+
 # Criar pasta de uploads se não existir
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+class _PGCursorWrapper:
+    """Cursor que aceita ? como placeholder (como SQLite) e expõe lastrowid para INSERT."""
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+    def execute(self, sql, params=()):
+        if params is None:
+            params = ()
+        sql_pg = sql.replace('?', '%s')
+        self._cursor.execute(sql_pg, params)
+        if sql.strip().upper().startswith('INSERT'):
+            try:
+                self._cursor.execute('SELECT lastval()')
+                self.lastrowid = self._cursor.fetchone()[0]
+            except Exception:
+                pass
+        return self
+    def executemany(self, sql, params_list):
+        sql_pg = sql.replace('?', '%s')
+        return self._cursor.executemany(sql_pg, params_list)
+    def _row_compat(self, r):
+        if not r or not hasattr(r, 'keys'):
+            return r
+        d = dict(r)
+        class _R(dict):
+            __getitem__ = lambda self, k: self['name'] if k == 1 and 'name' in self else dict.__getitem__(self, k)
+        return _R(d)
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return self._row_compat(row)
+    def fetchall(self):
+        return [self._row_compat(r) for r in self._cursor.fetchall()]
+    def close(self):
+        return self._cursor.close()
+
+class _PGConnWrapper:
+    def cursor(self):
+        try:
+            import psycopg2.extras
+            c = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        except Exception:
+            c = self._conn.cursor()
+        return _PGCursorWrapper(c)
+    def commit(self):
+        return self._conn.commit()
+    def close(self):
+        return self._conn.close()
+
 def get_db():
-    """Obter conexão com o banco de dados"""
+    """Obter conexão: PostgreSQL se DATABASE_URL estiver definido, senão SQLite local."""
+    if _using_pg:
+        try:
+            import psycopg2
+            # Render passa DATABASE_URL com postgres://; psycopg2 quer postgresql://
+            url = DATABASE_URL
+            if url.startswith('postgres://'):
+                url = 'postgresql://' + url[10:]
+            conn = psycopg2.connect(url)
+            return _PGConnWrapper(conn)
+        except Exception as e:
+            print(f'[AVISO] PostgreSQL falhou ({e}), a usar SQLite local.')
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -473,13 +544,34 @@ def verificar_data_anterior_e_codigo(data_operacao, codigo_fornecido=None):
         # Se não conseguir parsear a data, permitir (pode ser formato diferente)
         return True, None
 
+def _ddl_pg(sql):
+    """Converter DDL SQLite para PostgreSQL quando DATABASE_URL está definido."""
+    if not _using_pg or not isinstance(sql, str):
+        return sql
+    sql = sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
+    sql = sql.replace('AUTOINCREMENT', '')
+    return sql
+
 def init_db():
-    """Inicializar banco de dados com tabelas necessárias"""
+    """Inicializar banco de dados com tabelas necessárias (SQLite ou PostgreSQL)."""
+    import re
     conn = get_db()
     cursor = conn.cursor()
+    _execute = cursor.execute
+    def _exec(sql, params=()):
+        s = _ddl_pg(sql)
+        if _using_pg and 'PRAGMA table_info' in s:
+            m = re.search(r'PRAGMA table_info\((\w+)\)', s)
+            if m:
+                t = m.group(1)
+                s = f"SELECT (row_number() OVER (ORDER BY ordinal_position) - 1)::int AS cid, column_name AS name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '{t}'"
+        if params:
+            return _execute(s, params)
+        return _execute(s)
     
+
     # Tabela de Pedidos Pendentes (histórico completo - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS pedidos_pendentes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -495,13 +587,13 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_data ON pedidos_pendentes(data_entrega)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_cliente ON pedidos_pendentes(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_data ON pedidos_pendentes(data_entrega)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_pendentes_cliente ON pedidos_pendentes(cliente)')
     except:
         pass
     
     # Tabela de Pedidos Entregues (histórico completo - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS pedidos_entregues (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -517,13 +609,13 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_data ON pedidos_entregues(data_entrega)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_cliente ON pedidos_entregues(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_data ON pedidos_entregues(data_entrega)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_pedidos_entregues_cliente ON pedidos_entregues(cliente)')
     except:
         pass
     
     # Tabela de Planeamento Diário (histórico completo por data - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS planeamento_diario (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_planeamento DATE NOT NULL,
@@ -542,48 +634,48 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_planeamento_data ON planeamento_diario(data_planeamento)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_planeamento_data ON planeamento_diario(data_planeamento)')
     except:
         pass
     
     # Garantir coluna observacoes nas tabelas de pedidos (migração leve)
-    cursor.execute("PRAGMA table_info(pedidos_pendentes)")
+    _exec("PRAGMA table_info(pedidos_pendentes)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN observacoes TEXT')
         except:
             pass
 
-    cursor.execute("PRAGMA table_info(pedidos_entregues)")
+    _exec("PRAGMA table_info(pedidos_entregues)")
     columns = [row[1] for row in cursor.fetchall()]
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE pedidos_entregues ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE pedidos_entregues ADD COLUMN observacoes TEXT')
         except:
             pass
 
     # Coluna prioridade em pedidos_pendentes (para destacar em vermelho)
-    cursor.execute("PRAGMA table_info(pedidos_pendentes)")
+    _exec("PRAGMA table_info(pedidos_pendentes)")
     columns_pp = [row[1] for row in cursor.fetchall()]
     if 'prioridade' not in columns_pp:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN prioridade INTEGER DEFAULT 0')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN prioridade INTEGER DEFAULT 0')
             print("✅ Coluna 'prioridade' adicionada à tabela 'pedidos_pendentes'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'prioridade': {e}")
     # Coluna local_descarga em pedidos_pendentes e pedidos_entregues
     if 'local_descarga' not in columns_pp:
         try:
-            cursor.execute('ALTER TABLE pedidos_pendentes ADD COLUMN local_descarga TEXT')
+            _exec('ALTER TABLE pedidos_pendentes ADD COLUMN local_descarga TEXT')
             print("✅ Coluna 'local_descarga' adicionada à tabela 'pedidos_pendentes'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'local_descarga': {e}")
-    cursor.execute("PRAGMA table_info(pedidos_entregues)")
+    _exec("PRAGMA table_info(pedidos_entregues)")
     columns_pe = [row[1] for row in cursor.fetchall()]
     if 'local_descarga' not in columns_pe:
         try:
-            cursor.execute('ALTER TABLE pedidos_entregues ADD COLUMN local_descarga TEXT')
+            _exec('ALTER TABLE pedidos_entregues ADD COLUMN local_descarga TEXT')
             print("✅ Coluna 'local_descarga' adicionada à tabela 'pedidos_entregues'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'local_descarga': {e}")
@@ -591,7 +683,7 @@ def init_db():
     # ========== NOVA ESTRUTURA: Motoristas, Tratores, Cisternas, Conjuntos ==========
     
     # Tabela de Motoristas
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS motoristas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -605,47 +697,47 @@ def init_db():
     ''')
     
     # Migração: Adicionar colunas se não existirem (para tabelas criadas antes)
-    cursor.execute("PRAGMA table_info(motoristas)")
+    _exec("PRAGMA table_info(motoristas)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'telefone' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN telefone TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN telefone TEXT')
             print("✅ Coluna 'telefone' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'telefone': {e}")
     
     if 'email' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN email TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN email TEXT')
             print("✅ Coluna 'email' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'email': {e}")
     
     if 'ativo' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN ativo BOOLEAN DEFAULT 1')
+            _exec('ALTER TABLE motoristas ADD COLUMN ativo BOOLEAN DEFAULT 1')
             print("✅ Coluna 'ativo' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'ativo': {e}")
     
     if 'observacoes' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN observacoes TEXT')
+            _exec('ALTER TABLE motoristas ADD COLUMN observacoes TEXT')
             print("✅ Coluna 'observacoes' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'observacoes': {e}")
     
     if 'created_at' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            _exec('ALTER TABLE motoristas ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
             print("✅ Coluna 'created_at' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'created_at': {e}")
     
     if 'updated_at' not in columns:
         try:
-            cursor.execute('ALTER TABLE motoristas ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            _exec('ALTER TABLE motoristas ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
             print("✅ Coluna 'updated_at' adicionada à tabela motoristas")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'updated_at': {e}")
@@ -659,13 +751,13 @@ def init_db():
     ]:
         if col_name not in columns:
             try:
-                cursor.execute(f'ALTER TABLE motoristas ADD COLUMN {col_name} {col_def}')
+                _exec(f'ALTER TABLE motoristas ADD COLUMN {col_name} {col_def}')
                 print(f"✅ Coluna '{col_name}' adicionada à tabela motoristas")
             except Exception as e:
                 print(f"⚠️ Erro ao adicionar coluna '{col_name}': {e}")
     
     # Tabela de Tratores
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS tratores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL UNIQUE,
@@ -681,7 +773,7 @@ def init_db():
     ''')
     
     # Tabela de Cisternas
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cisternas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL UNIQUE,
@@ -696,7 +788,7 @@ def init_db():
     ''')
     
     # Tabela de Conjuntos Habituais (Trator + Cisterna + Motorista)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS conjuntos_habituais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL,
@@ -716,7 +808,7 @@ def init_db():
     ''')
     
     # Tabela de Atribuições Diárias (Motorista atribuído a um conjunto numa data específica)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS atribuicoes_motoristas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conjunto_id INTEGER NOT NULL,
@@ -731,28 +823,65 @@ def init_db():
     ''')
     
     # Migração: Adicionar coluna data_desativacao se não existir
-    cursor.execute("PRAGMA table_info(conjuntos_habituais)")
+    _exec("PRAGMA table_info(conjuntos_habituais)")
     columns_conjuntos = [row[1] for row in cursor.fetchall()]
     
     if 'data_desativacao' not in columns_conjuntos:
         try:
-            cursor.execute('ALTER TABLE conjuntos_habituais ADD COLUMN data_desativacao DATE')
+            _exec('ALTER TABLE conjuntos_habituais ADD COLUMN data_desativacao DATE')
             print("✅ Coluna 'data_desativacao' adicionada à tabela 'conjuntos_habituais'.")
         except Exception as e:
             print(f"⚠️ Erro ao adicionar coluna 'data_desativacao' à tabela 'conjuntos_habituais': {e}")
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conjuntos_habituais_ordem ON conjuntos_habituais(ordem)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_data ON atribuicoes_motoristas(data_atribuicao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_conjunto ON atribuicoes_motoristas(conjunto_id, data_atribuicao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_conjuntos_habituais_ordem ON conjuntos_habituais(ordem)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_data ON atribuicoes_motoristas(data_atribuicao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_atribuicoes_motoristas_conjunto ON atribuicoes_motoristas(conjunto_id, data_atribuicao)')
     except:
         pass
+    
+    # Migração: colunas para avaria/alteracao de serviço no card
+    cursor.execute("PRAGMA table_info(atribuicoes_motoristas)")
+    cols_atrib = [row[1] for row in cursor.fetchall()]
+    if 'avaria_alteracao' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_alteracao INTEGER DEFAULT 0')
+            print("✅ Coluna 'avaria_alteracao' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_alteracao': {e}")
+    if 'avaria_observacao' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_observacao TEXT')
+            print("✅ Coluna 'avaria_observacao' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_observacao': {e}")
+    if 'avaria_apos_ordem' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_apos_ordem INTEGER')
+            print("✅ Coluna 'avaria_apos_ordem' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_apos_ordem': {e}")
+    if 'avaria_nota' not in cols_atrib:
+        try:
+            cursor.execute('ALTER TABLE atribuicoes_motoristas ADD COLUMN avaria_nota TEXT')
+            print("✅ Coluna 'avaria_nota' adicionada à tabela 'atribuicoes_motoristas'.")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar coluna 'avaria_nota': {e}")
+
+    # Hora de início obrigatória (começar mais cedo): 05:00 ou 06:00 para um motorista num dia
+    _exec('''
+        CREATE TABLE IF NOT EXISTS motorista_inicio_cedo (
+            atribuicao_id INTEGER PRIMARY KEY,
+            hora_inicio TEXT NOT NULL,
+            FOREIGN KEY (atribuicao_id) REFERENCES atribuicoes_motoristas(id)
+        )
+    ''')
     
     # ========== SISTEMA DE AUTENTICAÇÃO E UTILIZADORES ==========
     
     # Tabela de Utilizadores do Sistema
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS utilizadores (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -768,14 +897,14 @@ def init_db():
     ''')
     
     # Criar utilizador admin padrão se não existir
-    cursor.execute('SELECT COUNT(*) as count FROM utilizadores WHERE is_admin = 1')
+    _exec('SELECT COUNT(*) as count FROM utilizadores WHERE is_admin = 1')
     admin_exists = cursor.fetchone()['count'] > 0
     
     if not admin_exists:
         import hashlib
         # Password padrão: admin123 (deve ser alterada após primeiro login)
         password_hash = hashlib.sha256('admin123'.encode()).hexdigest()
-        cursor.execute('''
+        _exec('''
             INSERT INTO utilizadores (username, password_hash, nome, is_admin, ativo)
             VALUES (?, ?, ?, ?, ?)
         ''', ('admin', password_hash, 'Administrador', 1, 1))
@@ -784,7 +913,7 @@ def init_db():
     # ========== BASE DE DADOS DE CLIENTES E LOCAIS DE DESCARGA ==========
     
     # Tabela de Clientes e Locais de Descarga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS clientes_locais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             cliente TEXT NOT NULL,
@@ -798,15 +927,15 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_clientes_locais_cliente ON clientes_locais(cliente)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_clientes_locais_ativo ON clientes_locais(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_clientes_locais_cliente ON clientes_locais(cliente)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_clientes_locais_ativo ON clientes_locais(ativo)')
     except:
         pass
     
     # ========== BASE DE DADOS DE LOCAIS DE CARGA ==========
     
     # Tabela de Locais de Carga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS locais_carga (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -819,14 +948,14 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_locais_carga_ativo ON locais_carga(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_locais_carga_ativo ON locais_carga(ativo)')
     except:
         pass
     
     # ========== BASE DE DADOS DE MATERIAIS ==========
     
     # Tabela de Materiais
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS materiais (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -839,13 +968,13 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_materiais_nome ON materiais(nome)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_materiais_ativo ON materiais(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_materiais_nome ON materiais(nome)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_materiais_ativo ON materiais(ativo)')
     except:
         pass
     
     # Materiais que cada cliente/local de descarga recebe (vistos na BD de clientes)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cliente_local_materiais (
             cliente_local_id INTEGER NOT NULL,
             material_id INTEGER NOT NULL,
@@ -855,7 +984,7 @@ def init_db():
         )
     ''')
     # Materiais que cada local de carga carrega (vistos na BD de locais de carga)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS local_carga_materiais (
             local_carga_id INTEGER NOT NULL,
             material_id INTEGER NOT NULL,
@@ -865,7 +994,7 @@ def init_db():
         )
     ''')
     # Locais de carga associados a cada cliente/local de descarga
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS cliente_local_locais_carga (
             cliente_local_id INTEGER NOT NULL,
             local_carga_id INTEGER NOT NULL,
@@ -875,15 +1004,15 @@ def init_db():
         )
     ''')
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cliente_local_mat_cl ON cliente_local_materiais(cliente_local_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_local_carga_mat_lc ON local_carga_materiais(local_carga_id)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_cliente_local_mat_cl ON cliente_local_materiais(cliente_local_id)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_local_carga_mat_lc ON local_carga_materiais(local_carga_id)')
     except:
         pass
     
     # ========== BASE DE DADOS DE CONJUNTOS COMPATÍVEIS ==========
     
     # Tabela de Conjuntos Compatíveis (autorização para alterar matrículas)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS conjuntos_compatives (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trator_id INTEGER NOT NULL,
@@ -900,14 +1029,14 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_conjuntos_compatives_autorizado ON conjuntos_compatives(autorizado)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_conjuntos_compatives_autorizado ON conjuntos_compatives(autorizado)')
     except:
         pass
     
     # ========== BASE DE DADOS DE TRANSPORTADORAS ==========
     
     # Tabela de Transportadoras
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS transportadoras (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL UNIQUE,
@@ -919,7 +1048,7 @@ def init_db():
     ''')
     
     # Tabela de Ativação de Transportadoras por Data
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS transportadoras_ativacao (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             transportadora_id INTEGER NOT NULL,
@@ -933,9 +1062,9 @@ def init_db():
     
     # Índices para melhor performance
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativo ON transportadoras(ativo)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_data ON transportadoras_ativacao(data_ativacao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_ativo ON transportadoras_ativacao(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativo ON transportadoras(ativo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_data ON transportadoras_ativacao(data_ativacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_transportadoras_ativacao_ativo ON transportadoras_ativacao(ativo)')
     except:
         pass
     
@@ -943,7 +1072,7 @@ def init_db():
     
     # ========== MANTER TABELA ANTIGA PARA COMPATIBILIDADE (migração gradual) ==========
     # Tabela de Viaturas e Motoristas (formato: PTSA | MATRÍCULA + CÓDIGO - NOME)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS viatura_motorista (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             matricula TEXT NOT NULL,
@@ -958,51 +1087,51 @@ def init_db():
     ''')
     
     # Verificar e adicionar colunas temporárias se não existirem
-    cursor.execute("PRAGMA table_info(viatura_motorista)")
+    _exec("PRAGMA table_info(viatura_motorista)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'temporario' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN temporario BOOLEAN DEFAULT 0')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN temporario BOOLEAN DEFAULT 0')
         except:
             pass
     
     if 'data_temporaria' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN data_temporaria DATE')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN data_temporaria DATE')
         except:
             pass
     
     # Verificar e adicionar colunas de status se não existirem
-    cursor.execute("PRAGMA table_info(viatura_motorista)")
+    _exec("PRAGMA table_info(viatura_motorista)")
     columns = [row[1] for row in cursor.fetchall()]
     
     if 'status' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN status TEXT')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN status TEXT')
         except:
             pass
     
     if 'observacao_status' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN observacao_status TEXT')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN observacao_status TEXT')
         except:
             pass
     
     if 'ordem' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN ordem INTEGER DEFAULT 0')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN ordem INTEGER DEFAULT 0')
         except:
             pass
     
     if 'data_desativacao' not in columns:
         try:
-            cursor.execute('ALTER TABLE viatura_motorista ADD COLUMN data_desativacao DATE')
+            _exec('ALTER TABLE viatura_motorista ADD COLUMN data_desativacao DATE')
         except:
             pass
     
     # Tabela de Associação Encomenda-ViaturaMotorista (histórico completo por data - nunca apagados)
-    cursor.execute('''
+    _exec('''
         CREATE TABLE IF NOT EXISTS encomenda_viatura (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             pedido_id INTEGER NOT NULL,
@@ -1017,9 +1146,9 @@ def init_db():
     
     # Índices para melhor performance com histórico
     try:
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_data ON encomenda_viatura(data_associacao)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_pedido ON encomenda_viatura(pedido_id, pedido_tipo)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_viatura ON encomenda_viatura(viatura_motorista_id, data_associacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_data ON encomenda_viatura(data_associacao)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_pedido ON encomenda_viatura(pedido_id, pedido_tipo)')
+        _exec('CREATE INDEX IF NOT EXISTS idx_encomenda_viatura_viatura ON encomenda_viatura(viatura_motorista_id, data_associacao)')
     except:
         pass
     
@@ -1139,9 +1268,24 @@ def init_db():
             descricao TEXT NOT NULL,
             dados_acao TEXT NOT NULL,
             data_acao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            revertido BOOLEAN DEFAULT 0
+            revertido BOOLEAN DEFAULT 0,
+            user_id INTEGER,
+            user_nome TEXT
         )
     ''')
+    # Garantir colunas de utilizador em historico_acoes (migração leve)
+    cursor.execute("PRAGMA table_info(historico_acoes)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if 'user_id' not in columns:
+        try:
+            cursor.execute('ALTER TABLE historico_acoes ADD COLUMN user_id INTEGER')
+        except:
+            pass
+    if 'user_nome' not in columns:
+        try:
+            cursor.execute('ALTER TABLE historico_acoes ADD COLUMN user_nome TEXT')
+        except:
+            pass
     
     # Tabela de matrículas temporárias (para troca de conjunto apenas da matrícula/código no dia)
     cursor.execute('''
@@ -1229,6 +1373,25 @@ def init_db():
         except Exception as e:
             print(f"⚠️ Erro ao adicionar numero_noites_fora: {e}")
     
+    # Matrícula temporária detalhada: permitir lookup por atribuicao_id (id do card no planeamento)
+    cursor.execute("PRAGMA table_info(matricula_temporaria_detalhada)")
+    mtd_cols = [row[1] for row in cursor.fetchall()]
+    if 'atribuicao_id' not in mtd_cols:
+        try:
+            cursor.execute('ALTER TABLE matricula_temporaria_detalhada ADD COLUMN atribuicao_id INTEGER')
+            print("✅ Coluna 'atribuicao_id' adicionada à tabela matricula_temporaria_detalhada")
+        except Exception as e:
+            print(f"⚠️ Erro ao adicionar atribuicao_id em matricula_temporaria_detalhada: {e}")
+    
+    # Marcar encomenda (linha no card) como "carregado no dia anterior" — borda na encomenda
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS encomenda_carregado_dia_anterior (
+            encomenda_viatura_id INTEGER NOT NULL PRIMARY KEY,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (encomenda_viatura_id) REFERENCES encomenda_viatura(id)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -1275,6 +1438,25 @@ def verificar_login():
         return dict(user)
     
     return None
+
+def registar_historico_acao(cursor, tipo_acao, descricao, dados_acao):
+    """
+    Registar ação no histórico incluindo o utilizador que a executou.
+    - cursor: cursor da base de dados já aberto
+    - tipo_acao: string
+    - descricao: string
+    - dados_acao: string JSON (já serializado)
+    """
+    try:
+        user = verificar_login()
+    except Exception:
+        user = None
+    user_id = user.get('id') if user else None
+    user_nome = (user.get('nome') or user.get('username')) if user else None
+    cursor.execute('''
+        INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao, user_id, user_nome)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (tipo_acao, descricao, dados_acao, user_id, user_nome))
 
 def login_required(f):
     """Decorator para proteger rotas que requerem login"""
@@ -1333,28 +1515,36 @@ def login_page():
 @app.route('/api/utilizadores-login', methods=['GET'])
 def listar_utilizadores_login():
     """Listar utilizadores ativos para o dropdown de login (sem autenticação)"""
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT id, username, nome, is_admin
-        FROM utilizadores
-        WHERE ativo = 1
-        ORDER BY nome ASC
-    ''')
-    utilizadores = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    
-    # Converter booleanos
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, username, nome, is_admin
+            FROM utilizadores
+            WHERE ativo = 1
+            ORDER BY nome ASC
+        ''')
+        utilizadores = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+    except Exception:
+        try:
+            init_db()
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute('SELECT id, username, nome, is_admin FROM utilizadores WHERE ativo = 1 ORDER BY nome ASC')
+            utilizadores = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+        except Exception:
+            utilizadores = []
     for u in utilizadores:
-        u['is_admin'] = bool(u['is_admin'])
-    
+        u['is_admin'] = bool(u.get('is_admin'))
     return jsonify(utilizadores)
 
 @app.route('/api/login', methods=['POST'])
 def login():
     """Autenticar utilizador"""
-    data = request.get_json()
-    username = data.get('username', '').strip()
+    data = request.get_json() or {}
+    username = (data.get('username') or '').strip()
     password = data.get('password', '')
     
     if not username or not password:
@@ -1362,6 +1552,17 @@ def login():
     
     conn = get_db()
     cursor = conn.cursor()
+    # Garantir que a tabela e o admin existem (ex.: primeiro deploy no Render)
+    try:
+        cursor.execute('SELECT COUNT(*) as c FROM utilizadores WHERE ativo = 1')
+        if cursor.fetchone()['c'] == 0:
+            init_db()
+            conn = get_db()
+            cursor = conn.cursor()
+    except Exception:
+        init_db()
+        conn = get_db()
+        cursor = conn.cursor()
     cursor.execute('SELECT * FROM utilizadores WHERE username = ? AND ativo = 1', (username,))
     user = cursor.fetchone()
     
@@ -1369,9 +1570,10 @@ def login():
         conn.close()
         return jsonify({'success': False, 'error': 'Credenciais inválidas'}), 401
     
-    # Verificar password
+    # Verificar password (comparar como string para evitar falhas de tipo)
     password_hash = hash_password(password)
-    if user['password_hash'] != password_hash:
+    stored_hash = (user['password_hash'] or '').strip()
+    if stored_hash != password_hash:
         conn.close()
         return jsonify({'success': False, 'error': 'Credenciais inválidas'}), 401
     
@@ -1423,102 +1625,181 @@ def check_auth():
 
 # ==================== ROTAS PRINCIPAIS ====================
 
-@app.route('/tunnel-ok')
-def tunnel_ok():
-    """Rota de teste para verificar se o túnel Cloudflare/ngrok chega à aplicação (sem login)."""
-    return 'OK - túnel a funcionar', 200, {'Content-Type': 'text/plain; charset=utf-8'}
-
-
-@app.route('/qr')
-def qr_telemovel():
-    """Página com link e QR code para abrir a app no telemóvel (fora da rede). Sem login."""
-    url = app.config.get('URL_PUBLICA') or ''
+@app.route('/link')
+def link_fora_rede():
+    """Página informativa: aplicação apenas na rede local ou via VPN. Sem login."""
     from flask import render_template_string
-    if not url:
-        html = '''
-        <!DOCTYPE html>
-        <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Abrir no telemóvel</title>
-        <style>body{font-family:sans-serif;max-width:400px;margin:2rem auto;padding:1rem;text-align:center;}
-        .msg{background:#fff3cd;padding:1rem;border-radius:8px;margin:1rem 0;}
-        a{color:#0d6efd;}</style></head><body>
-        <h1>📱 Abrir no telemóvel</h1>
-        <p class="msg">Túnel ainda a iniciar. Aguarde ~15 segundos e <a href="/qr">actualize esta página</a>.</p>
-        <p><a href="/login">Voltar ao login</a></p>
-        <script>setTimeout(function(){ location.reload(); }, 8000);</script>
-        </body></html>'''
-        return render_template_string(html)
-    import urllib.parse
-    url_esc = urllib.parse.quote(url, safe='')
-    qr_src = f'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={url_esc}'
-    url_alt = app.config.get('URL_PUBLICA_ALT') or ''
-    alt_block = ''
-    if url_alt and url_alt != url:
-        alt_block = f'<p class="sub" style="margin-top:1.5rem;background:#e7f3ff;padding:0.75rem;border-radius:8px;">Se a página ficar em branco, use no telemóvel em <strong>dados móveis</strong>:<br><a href="{url_alt}" target="_blank" rel="noopener">{url_alt}</a></p>'
-    html = f'''
+    import socket
+    port = app.config.get('SERVER_PORT', 8080)
+    ip_local = app.config.get('IP_LOCAL')
+    if not ip_local:
+        try:
+            hostname = socket.gethostname()
+            ip_local = socket.gethostbyname(hostname)
+            for res in socket.getaddrinfo(hostname, None, socket.AF_INET):
+                ip = (res[4][0] if res[4] else '').strip()
+                if ip and not ip.startswith('127.') and (ip.startswith('192.168.') or ip.startswith('10.')):
+                    ip_local = ip
+                    break
+        except Exception:
+            ip_local = ''
+    url_servidor = f"http://{ip_local}:{port}" if ip_local else f"http://<IP-DESTE-PC>:{port}"
+    html = '''
     <!DOCTYPE html>
     <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Abrir no telemóvel</title>
-    <style>body{{font-family:sans-serif;max-width:420px;margin:2rem auto;padding:1rem;text-align:center;}}
-    h1{{margin-bottom:0.5rem;}} .qr{{margin:1.5rem 0;}} .qr img{{border:1px solid #ddd;border-radius:12px;}}
-    .link{{word-break:break-all;background:#f0f0f0;padding:0.75rem;border-radius:8px;margin:1rem 0;font-size:0.9rem;}}
-    a{{color:#0d6efd;}} .sub{{color:#666;font-size:0.9rem;margin-top:1rem;}}</style></head><body>
-    <h1>📱 Abrir no telemóvel</h1>
-    <p>Apontar a câmara ao QR code ou clicar no link em baixo.</p>
-    <div class="qr"><img src="{qr_src}" alt="QR code" width="220" height="220"></div>
-    <p class="link"><a href="{url}" target="_blank" rel="noopener">{url}</a></p>
-    <p class="sub">Use no telemóvel (dados móveis ou outra rede).</p>
-    {alt_block}
-    <p><a href="/login">Voltar ao login</a></p>
+    <title>Acesso à aplicação</title>
+    <style>body{font-family:sans-serif;max-width:480px;margin:2rem auto;padding:1rem;text-align:center;}
+    .msg{background:#e8f5e9;padding:1.25rem;border-radius:12px;margin:1rem 0;text-align:left;}
+    .url{background:#e3f2fd;padding:1rem;border-radius:8px;margin:1rem 0;word-break:break-all;font-size:1.1rem;}
+    .aviso{background:#fff3cd;padding:1rem;border-radius:8px;margin:1rem 0;text-align:left;font-size:0.95rem;}
+    .aviso h3{margin-top:0;}
+    a{color:#0d6efd;} code{background:#f5f5f5;padding:2px 6px;border-radius:4px;}</style></head><body>
+    <h1>Acesso à aplicação</h1>
+    <p class="msg">Esta aplicação está disponível <strong>apenas na rede corporativa</strong> ou através de <strong>VPN</strong>.</p>
+    <p><strong>Endereço para partilhar com a tua colega (mesma rede ou VPN):</strong></p>
+    <p class="url"><a href="''' + url_servidor + '''" target="_blank" rel="noopener">''' + url_servidor + '''</a></p>
+    <p>Ela deve abrir este link no browser.</p>
+    <div class="aviso">
+    <h3>Se a tua colega não conseguir aceder</h3>
+    <ol style="margin:0.5rem 0; padding-left:1.25rem;">
+    <li><strong>Mesma rede?</strong> Os dois PCs têm de estar na mesma Wi‑Fi/LAN ou ela ligada à VPN da empresa.</li>
+    <li><strong>Firewall:</strong> A porta abre ao iniciar a app (ou execute <code>ABRIR_PORTA_8080_FIREWALL.bat</code> como administrador uma vez).</li>
+    <li>Ela deve escrever no browser exactamente o endereço acima.</li>
+    </ol>
+    </div>
+    <p><a href="/partilha">Ver todas as opções (rede, VPN, servidor interno)</a></p>
+    <p><a href="/diagnostico">Diagnóstico de rede (ver todos os IPs e como testar)</a></p>
+    <p><a href="/login">Ir para login</a></p>
     </body></html>'''
     return render_template_string(html)
 
 
-@app.route('/acesso-remoto')
-def acesso_remoto():
-    """Página fácil: abrir no telemóvel com dados móveis (sem instalar nada). Sem login."""
+@app.route('/diagnostico')
+def diagnostico_rede():
+    """Página de diagnóstico: mostra todos os IPs e como testar o acesso noutro PC. Sem login."""
     from flask import render_template_string
-    import urllib.parse
-    url = app.config.get('URL_PUBLICA') or ''
-    if url:
-        url_esc = urllib.parse.quote(url, safe='')
-        qr_src = f'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={url_esc}'
-        html = f'''
-        <!DOCTYPE html>
-        <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Abrir no telemóvel</title>
-        <style>body{{font-family:sans-serif;max-width:420px;margin:2rem auto;padding:1rem;text-align:center;}}
-        h1{{font-size:1.25rem;}} .box{{background:#e3f2fd;padding:1rem;border-radius:12px;margin:1rem 0;text-align:left;}}
-        .step{{margin:0.5rem 0;}} .qr{{margin:1rem 0;}} .link{{word-break:break-all;background:#fff;padding:1rem;border-radius:8px;margin:1rem 0;font-size:1rem;}}
-        a{{color:#0d6efd;}} .btn{{display:inline-block;background:#1976d2;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;margin:0.5rem;}}</style></head><body>
-        <h1>📱 Abrir no telemóvel (fácil)</h1>
-        <div class="box">
-        <div class="step"><strong>1.</strong> No telemóvel, desligue o Wi-Fi.</div>
-        <div class="step"><strong>2.</strong> Ative os dados móveis (4G/5G).</div>
-        <div class="step"><strong>3.</strong> Abra o link em baixo ou leia o QR code.</div>
-        </div>
-        <p>Não precisa instalar nada.</p>
-        <div class="qr"><img src="{qr_src}" alt="QR" width="220" height="220"></div>
-        <p class="link"><a href="{url}" target="_blank" rel="noopener">{url}</a></p>
-        <p><a href="{url}" class="btn" target="_blank" rel="noopener">Abrir app</a></p>
-        <p><a href="/login">Voltar ao login</a></p>
-        </body></html>'''
-    else:
-        html = '''
-        <!DOCTYPE html>
-        <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Abrir no telemóvel</title>
-        <style>body{font-family:sans-serif;max-width:420px;margin:2rem auto;padding:1rem;text-align:center;}
-        .box{background:#fff3cd;padding:1rem;border-radius:12px;margin:1rem 0;}</style></head><body>
-        <h1>📱 Abrir no telemóvel</h1>
-        <div class="box">
-        <p>A URL ainda está a ser gerada. Aguarde ~15 segundos e <a href="/acesso-remoto">actualize esta página</a>.</p>
-        <p>Ou veja no terminal do servidor a URL que começa por https://....trycloudflare.com</p>
-        </div>
-        <p><a href="/login">Voltar ao login</a> &nbsp;|&nbsp; <a href="/qr">Ver /qr</a></p>
-        <script>setTimeout(function(){ location.reload(); }, 10000);</script>
-        </body></html>'''
+    import socket
+    port = app.config.get('SERVER_PORT', 8080)
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for res in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = (res[4][0] if len(res[4]) else '').strip()
+            if ip and not ip.startswith('127.'):
+                ips.append(ip)
+        if not ips:
+            ip = socket.gethostbyname(hostname)
+            if ip and not ip.startswith('127.'):
+                ips.append(ip)
+        # Colocar IP da LAN (192.168 / 10) primeiro
+        ips_sort = [ip for ip in ips if ip.startswith('192.168.') or ip.startswith('10.')]
+        ips_sort += [ip for ip in ips if ip not in ips_sort]
+        if ips_sort:
+            ips = ips_sort
+    except Exception:
+        pass
+    if not ips:
+        ips = ['<ipconfig no terminal>']
+    urls = [f"http://{ip}:{port}" for ip in ips]
+    urls_health = [f"http://{ip}:{port}/health" for ip in ips]
+    html = '''
+    <!DOCTYPE html>
+    <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Diagnóstico de rede</title>
+    <style>body{font-family:sans-serif;max-width:620px;margin:2rem auto;padding:1rem;}
+    h1{font-size:1.3rem;} h2{font-size:1.05rem; margin-top:1.5rem;}
+    .box{background:#f0f7ff;border:1px solid #b3d9ff;padding:1rem;border-radius:8px;margin:1rem 0;}
+    .erro{background:#ffebee;border:1px solid #ffcdd2;}
+    .ok{background:#e8f5e9;border:1px solid #a5d6a7;}
+    code{background:#f5f5f5;padding:2px 6px;border-radius:4px;word-break:break-all;}
+    ul{ margin:0.5rem 0; padding-left:1.5rem;} a{color:#0d6efd;}</style></head><body>
+    <h1>Diagnóstico – acesso de outro PC</h1>
+    <p>Usa esta página para descobrir o endereço correcto e testar se a tua colega consegue chegar ao servidor.</p>
+    <h2>1. Endereços deste PC (experimenta cada um no PC da colega)</h2>
+    <div class="box">
+    <ul>
+    ''' + ''.join(f'<li><a href="{u}" target="_blank" rel="noopener">{u}</a></li>' for u in urls) + '''
+    </ul>
+    <p>Se não aparecer nenhum IP útil, abre <strong>PowerShell</strong> ou <strong>Cmd</strong> e escreve <code>ipconfig</code>. Procura o endereço <strong>IPv4</strong> do adaptador que usas para a rede (Wi‑Fi ou Ethernet).</p>
+    </div>
+    <h2>2. Teste simples (no PC da colega)</h2>
+    <div class="box ok">
+    <p>A tua colega deve abrir no browser um destes links (troca pelo IP que apareceu em cima):</p>
+    <ul>
+    ''' + ''.join(f'<li><a href="{u}" target="_blank" rel="noopener">{u}</a></li>' for u in urls_health) + '''
+    </ul>
+    <p>Se aparecer uma página com <strong>OK</strong> ou dados de health, a rede está a funcionar. Aí pode usar o link da aplicação (igual mas sem <code>/health</code>).</p>
+    <p>Se der <strong>erro de conexão / site inacessível</strong>:</p>
+    <ul>
+    <li><strong>Firewall:</strong> A porta 8080 abre ao iniciar a app; se precisar, execute <code>ABRIR_PORTA_8080_FIREWALL.bat</code> como administrador.</li>
+    <li><strong>Rede:</strong> Os dois PCs na mesma Wi‑Fi/LAN.</li>
+    </ul>
+    </div>
+    <h2>3. Verificar porta (no teu PC)</h2>
+    <div class="box">
+    <p>No PowerShell: <code>Test-NetConnection -ComputerName 127.0.0.1 -Port 8080</code></p>
+    <p>Se <code>TcpTestSucceeded : True</code>, o servidor está a escutar.</p>
+    </div>
+    <p><a href="/link">Voltar à página de acesso</a> &nbsp;|&nbsp; <a href="/partilha">Opções de acesso</a> &nbsp;|&nbsp; <a href="/login">Login</a></p>
+    </body></html>'''
     return render_template_string(html)
+
+
+@app.route('/partilha')
+def partilha_link():
+    """Opções para a colega aceder: rede local, VPN, ou servidor interno. Sem túneis. Sem login."""
+    from flask import render_template_string
+    html = '''
+    <!DOCTYPE html>
+    <html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Como a colega pode aceder (sem túneis)</title>
+    <style>body{font-family:sans-serif;max-width:620px;margin:2rem auto;padding:1rem;}
+    h1{font-size:1.3rem;} h2{font-size:1.05rem;margin-top:1.5rem;}
+    .opcao{background:#e8f5e9;border-left:4px solid #4caf50;padding:1.25rem;border-radius:0 8px 8px 0;margin:1rem 0;}
+    .opcao h2{margin-top:0;} code{background:#f5f5f5;padding:2px 6px;border-radius:4px;}
+    .servidor{background:#e3f2fd;border-left:4px solid #1976d2;}
+    a{color:#0d6efd;} ul{margin:0.5rem 0;padding-left:1.25rem;}</style></head><body>
+    <h1>Como a colega pode aceder à aplicação</h1>
+    <p>A organização não permite túneis. Use uma destas opções:</p>
+    <div class="opcao">
+    <h2>1. Rede local + Firewall</h2>
+    <ul>
+    <li>Os dois PCs na <strong>mesma rede</strong> (mesma Wi‑Fi/LAN).</li>
+    <li>A porta 8080 abre ao iniciar a app (ou execute <strong>ABRIR_PORTA_8080_FIREWALL.bat</strong> como administrador uma vez).</li>
+    <li>Envie à colega o endereço que aparece em <a href="/link">/link</a> (ex.: <code>http://192.168.1.50:8080</code>). Ela abre no browser.</li>
+    </ul>
+    <p><strong>Se a firewall está OK e mesmo assim não dá:</strong> A rede está a bloquear entre PCs. Peça à colega que execute no PC dela o ficheiro <code>TESTAR_ACESSO_NA_REDE.bat</code> (envie-o por email/Teams). Ela introduce o teu IP; se aparecer FALHOU, a rede bloqueia – use a opção 2 (VPN) ou 3 (servidor interno).</p>
+    </div>
+    <div class="opcao">
+    <h2>2. VPN da empresa</h2>
+    <ul>
+    <li>A colega liga-se à <strong>VPN da organização</strong> (a que já usa para trabalho).</li>
+    <li>Depois abre no browser o mesmo endereço da rede local (ex.: <code>http://&lt;IP-do-teu-PC&gt;:8080</code>).</li>
+    <li>Com a VPN, o tráfego passa pela rede interna e o IT normalmente permite.</li>
+    </ul>
+    </div>
+    <div class="opcao servidor">
+    <h2>3. Servidor interno (recomendado se 1 e 2 falharem)</h2>
+    <p>Colocar a aplicação num <strong>servidor ou PC que ambos consigam alcançar</strong> na rede (ex.: servidor de desenvolvimento, VM, ou um PC com IP/hostname conhecido pelo IT).</p>
+    <ul>
+    <li>Copie a pasta do projeto (ou o código) para esse servidor.</li>
+    <li>No servidor: instale Python, <code>pip install -r requirements.txt</code>, e execute <code>python app.py</code> (ou use um serviço como NSSM no Windows para correr em segundo plano).</li>
+    <li>Peça ao IT para abrir a porta 8080 nesse servidor (ou use o hostname que já exista).</li>
+    <li>Tu e a colega acedem com <code>http://&lt;nome-ou-IP-do-servidor&gt;:8080</code>.</li>
+    </ul>
+    <p>Assim a app fica num único sítio acessível a todos na rede, sem depender do teu PC e sem túneis.</p>
+    </div>
+    <p><a href="/link">Ver endereço para partilhar</a> &nbsp;|&nbsp; <a href="/diagnostico">Diagnóstico de rede</a> &nbsp;|&nbsp; <a href="/login">Login</a></p>
+    </body></html>'''
+    return render_template_string(html)
+
+
+@app.route('/qr')
+@app.route('/acesso-remoto')
+def redirecionar_link():
+    """Redirecionar antigas rotas de túnel para a página de acesso (rede/VPN)."""
+    from flask import redirect
+    return redirect('/link', code=302)
 
 
 @app.route('/')
@@ -1604,6 +1885,44 @@ def get_planeamento_diario():
     planeamento = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return jsonify(planeamento)
+
+@app.route('/api/set-hora-saida', methods=['POST'])
+def api_set_hora_saida():
+    """Hora de saída do motorista (5h ou 6h). Body: { atribuicao_id, hora_inicio_cedo }."""
+    try:
+        data = request.get_json() or {}
+        aid = data.get('atribuicao_id')
+        if aid is None:
+            return jsonify({'success': False, 'error': 'atribuicao_id em falta'}), 400
+        try:
+            atribuicao_id = int(aid)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'atribuicao_id inválido'}), 400
+        hora = (data.get('hora_inicio_cedo') or data.get('hora_inicio') or '').strip()
+        if hora in ('05:00', '5', '5h', '5:00'):
+            hora = '05:00'
+        elif hora in ('06:00', '6', '6h', '6:00'):
+            hora = '06:00'
+        else:
+            hora = None
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({'success': False, 'error': 'Atribuição não encontrada'}), 404
+        if hora:
+            cursor.execute(
+                'INSERT OR REPLACE INTO motorista_inicio_cedo (atribuicao_id, hora_inicio) VALUES (?, ?)',
+                (atribuicao_id, hora)
+            )
+        else:
+            cursor.execute('DELETE FROM motorista_inicio_cedo WHERE atribuicao_id = ?', (atribuicao_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True, 'hora_inicio_cedo': hora})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/mover-para-entregues', methods=['POST'])
 def mover_para_entregues():
@@ -2324,10 +2643,8 @@ def atualizar_pendente():
             
             # Registar ação no histórico se for alteração de data
             if field == 'data_entrega':
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'ALTERAR_DATA_PEDIDO',
                     f'Alterar data de entrega: {pedido_antigo_dict.get("cliente", "")} - {valor_antigo} → {value}',
                     json.dumps({
@@ -2339,7 +2656,7 @@ def atualizar_pendente():
                         'data_antiga': valor_antigo,
                         'data_nova': value
                     })
-                ))
+                )
         
         conn.commit()
         conn.close()
@@ -2400,10 +2717,8 @@ def atualizar_entregue():
             
             # Registar ação no histórico se for alteração de data
             if field == 'data_entrega':
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'ALTERAR_DATA_PEDIDO',
                     f'Alterar data de entrega: {pedido_antigo_dict.get("cliente", "")} - {valor_antigo} → {value}',
                     json.dumps({
@@ -2415,7 +2730,7 @@ def atualizar_entregue():
                         'data_antiga': valor_antigo,
                         'data_nova': value
                     })
-                ))
+                )
         
         conn.commit()
         conn.close()
@@ -2484,10 +2799,8 @@ def remover_pedido():
         cursor.execute(f'DELETE FROM {tabela} WHERE id = ?', (pedido_id,))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'REMOVER_PEDIDO',
             f'Remover pedido {tipo}: {pedido["cliente"]} - {pedido.get("local_carga", "")} - {pedido.get("material", "")}',
             json.dumps({
@@ -2500,7 +2813,7 @@ def remover_pedido():
                 'observacoes': pedido.get('observacoes', ''),
                 'atribuicoes': [{'viatura_motorista_id': a[3], 'data_associacao': a[4], 'nome_motorista': a[6], 'matricula': a[7]} for a in atribuicoes] if atribuicoes else []
             })
-        ))
+        )
     
     conn.commit()
     conn.close()
@@ -2943,10 +3256,8 @@ def apagar_viatura_motorista_permanente(vm_id):
         ''', (data_atual, vm_id))
         
         # Registar ação no histórico com TODOS os dados necessários para reverter
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'APAGAR_CARD_PERMANENTE',
             f'Apagar card permanentemente a partir de {data_atual}: {motorista[2]} ({motorista[1]})',
             json.dumps({
@@ -2965,7 +3276,7 @@ def apagar_viatura_motorista_permanente(vm_id):
                 'matriculas_detalhadas_removidas': matriculas_detalhadas_dados,
                 'observacoes_temp_removidas': observacoes_dados
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -2990,14 +3301,61 @@ def apagar_viatura_motorista_permanente(vm_id):
             'error': str(e)
         }), 500
 
+def _resolver_viatura_motorista_id(cursor, id_recebido):
+    """Converte id_recebido em viatura_motorista_id. Se for atribuicao_id (card), resolve pelo motorista da atribuição."""
+    cursor.execute('SELECT id, matricula, nome_motorista FROM viatura_motorista WHERE id = ?', (id_recebido,))
+    row = cursor.fetchone()
+    if row:
+        return row[0], row[1], row[2]
+    # Pode ser atribuicao_id (card do planeamento)
+    cursor.execute('''
+        SELECT a.id, m.nome
+        FROM atribuicoes_motoristas a
+        LEFT JOIN motoristas m ON a.motorista_id = m.id
+        WHERE a.id = ?
+    ''', (id_recebido,))
+    atr = cursor.fetchone()
+    if not atr:
+        return None, None, None
+    nome_motorista = (atr[1] or '').strip() if atr[1] else None
+    if not nome_motorista:
+        cursor.execute('''
+            SELECT m.nome FROM conjuntos_habituais c
+            LEFT JOIN motoristas m ON c.motorista_id = m.id
+            WHERE c.id = (SELECT conjunto_id FROM atribuicoes_motoristas WHERE id = ?)
+        ''', (id_recebido,))
+        m_row = cursor.fetchone()
+        nome_motorista = (m_row[0] or '').strip() if m_row and m_row[0] else None
+    if not nome_motorista:
+        return None, None, None
+    cursor.execute('SELECT id, matricula, nome_motorista FROM viatura_motorista WHERE UPPER(TRIM(nome_motorista)) = UPPER(TRIM(?)) AND ativo = 1 LIMIT 1', (nome_motorista,))
+    vm = cursor.fetchone()
+    if vm:
+        return vm[0], vm[1], vm[2]
+    # Criar viatura_motorista para este motorista (matrícula do conjunto)
+    cursor.execute('SELECT conjunto_id FROM atribuicoes_motoristas WHERE id = ?', (id_recebido,))
+    ci = cursor.fetchone()
+    conjunto_id = ci[0] if ci else None
+    matricula = 'N/A'
+    if conjunto_id:
+        cursor.execute('SELECT t.matricula, cis.matricula FROM conjuntos_habituais c LEFT JOIN tratores t ON c.trator_id = t.id LEFT JOIN cisternas cis ON c.cisterna_id = cis.id WHERE c.id = ?', (conjunto_id,))
+        mat_row = cursor.fetchone()
+        if mat_row and (mat_row[0] or mat_row[1]):
+            matricula = f"{mat_row[0] or ''} + {mat_row[1] or ''}".strip(' +') or 'N/A'
+    cursor.execute('INSERT INTO viatura_motorista (matricula, codigo, nome_motorista, status, ativo) VALUES (?, ?, ?, \'Normal\', 1)', (matricula, '', nome_motorista))
+    vm_id_new = cursor.lastrowid
+    return vm_id_new, matricula, nome_motorista
+
+
 @app.route('/api/viatura-motorista/<int:vm_id>/matricula', methods=['PUT'])
 def alterar_matricula_viatura(vm_id):
-    """Alterar matrícula de uma viatura/motorista (temporariamente para o dia)"""
+    """Alterar matrícula de uma viatura/motorista (temporariamente para o dia). Aceita vm_id ou atribuicao_id (id do card)."""
     try:
-        data = request.json
-        matricula_trator = data.get('matricula_trator', '').strip().upper()
-        matricula_galera = data.get('matricula_galera', '').strip().upper()
-        data_associacao = data.get('data_associacao', date.today().isoformat())
+        id_recebido = vm_id  # na URL vem o atribuicao_id (id do card) enviado pelo frontend
+        data = request.json or {}
+        matricula_trator = (data.get('matricula_trator') or '').strip().upper()
+        matricula_galera = (data.get('matricula_galera') or '').strip().upper()
+        data_associacao = data.get('data_associacao') or date.today().isoformat()
         
         if not matricula_trator and not matricula_galera:
             return jsonify({'success': False, 'error': 'Pelo menos uma matrícula (trator ou galera) é obrigatória'}), 400
@@ -3005,22 +3363,23 @@ def alterar_matricula_viatura(vm_id):
         conn = get_db()
         cursor = conn.cursor()
         
-        # Verificar se o motorista existe
-        cursor.execute('SELECT id, matricula, nome_motorista FROM viatura_motorista WHERE id = ?', (vm_id,))
-        motorista = cursor.fetchone()
-        
-        if not motorista:
+        vm_id_real, matricula_original, nome_motorista = _resolver_viatura_motorista_id(cursor, id_recebido)
+        if vm_id_real is None:
             conn.close()
             return jsonify({'success': False, 'error': 'Motorista não encontrado'}), 404
+        motorista = (nome_motorista, matricula_original, nome_motorista)
+        vm_id = vm_id_real
         
         matricula_original = motorista[1]
         
-        # Guardar matrículas temporárias para o dia (substitui se já existir)
+        # Guardar matrículas temporárias para o dia (substitui se já existir).
+        # atribuicao_id = id do card no planeamento para lookup direto ao carregar cards.
+        atribuicao_id_card = id_recebido
         cursor.execute('''
             INSERT OR REPLACE INTO matricula_temporaria_detalhada 
-            (viatura_motorista_id, data_associacao, matricula_trator, matricula_galera)
-            VALUES (?, ?, ?, ?)
-        ''', (vm_id, data_associacao, matricula_trator if matricula_trator else None, matricula_galera if matricula_galera else None))
+            (viatura_motorista_id, data_associacao, matricula_trator, matricula_galera, atribuicao_id)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (vm_id, data_associacao, matricula_trator if matricula_trator else None, matricula_galera if matricula_galera else None, atribuicao_id_card))
         
         # Construir descrição da alteração
         descricao_matriculas = []
@@ -3031,10 +3390,8 @@ def alterar_matricula_viatura(vm_id):
         descricao_completa = " + ".join(descricao_matriculas) if descricao_matriculas else "Nenhuma"
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'ALTERAR_MATRICULA',
             f'Alterar matrícula (dia {data_associacao}): {motorista[2]} - {descricao_completa}',
             json.dumps({
@@ -3045,7 +3402,7 @@ def alterar_matricula_viatura(vm_id):
                 'data_associacao': data_associacao,
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3070,22 +3427,20 @@ def alterar_matricula_viatura(vm_id):
 
 @app.route('/api/viatura-motorista/<int:vm_id>/observacao', methods=['PUT'])
 def alterar_observacao_temporaria(vm_id):
-    """Adicionar/alterar observação temporária para o dia"""
+    """Adicionar/alterar observação temporária para o dia. Aceita vm_id ou atribuicao_id (id do card)."""
     try:
-        data = request.json
-        observacao = data.get('observacao', '').strip()
-        data_associacao = data.get('data_associacao', date.today().isoformat())
+        data = request.json or {}
+        observacao = (data.get('observacao') or '').strip()
+        data_associacao = data.get('data_associacao') or date.today().isoformat()
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Verificar se o motorista existe
-        cursor.execute('SELECT id, nome_motorista FROM viatura_motorista WHERE id = ?', (vm_id,))
-        motorista = cursor.fetchone()
-        
-        if not motorista:
+        vm_id_real, _, _ = _resolver_viatura_motorista_id(cursor, vm_id)
+        if vm_id_real is None:
             conn.close()
             return jsonify({'success': False, 'error': 'Motorista não encontrado'}), 404
+        vm_id = vm_id_real
         
         if observacao:
             # Guardar observação temporária (substitui se já existir)
@@ -3281,10 +3636,8 @@ def atualizar_status_viatura_motorista(vm_id):
                 if data_inicio_anterior and data_fim_anterior:
                     descricao += f' (período: {data_inicio_anterior} a {data_fim_anterior})'
                 
-                cursor.execute('''
-                    INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                    VALUES (?, ?, ?)
-                ''', (
+                registar_historico_acao(
+                    cursor,
                     'DISPONIBILIDADE_FORCADA',
                     descricao,
                     json.dumps({
@@ -3297,7 +3650,7 @@ def atualizar_status_viatura_motorista(vm_id):
                         'data_inicio_anterior': data_inicio_anterior,
                         'data_fim_anterior': data_fim_anterior
                     })
-                ))
+                )
                 conn.commit()
                 print(f"DEBUG - Disponibilidade forçada registada: {descricao}")
         
@@ -3312,13 +3665,7 @@ def atualizar_status_viatura_motorista(vm_id):
                     conn.close()
                 return jsonify({'success': False, 'error': f'Data inválida: {str(e)}'}), 400
             
-            # Remover status antigos do mesmo tipo para este motorista
-            cursor.execute('''
-                DELETE FROM viatura_motorista_status 
-                WHERE viatura_motorista_id = ? AND status = ?
-            ''', (viatura_motorista_id, status))
-            
-            # Criar registos para cada dia útil do período
+            # Criar registos para cada dia útil do período (sem apagar registos anteriores)
             data_atual = data_inicio_obj
             while data_atual <= data_fim_obj:
                 # Só criar para dias úteis (segunda a sexta)
@@ -3447,10 +3794,8 @@ def remover_viatura_motorista(vm_id):
         ''', (data_atual, vm_id))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'DESATIVAR_CARD_DATA_ATUAL',
             f'Desativar card a partir de {data_atual}: {motorista[2]} ({motorista[1]})',
             json.dumps({
@@ -3460,7 +3805,7 @@ def remover_viatura_motorista(vm_id):
                 'matricula': motorista[1],
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3745,6 +4090,14 @@ def atribuir_encomenda():
         resultado = cursor.fetchone()
         proxima_ordem = resultado[0] if resultado else 1
         
+        # Se a atribuição tem avaria, novas encomendas devem ficar depois da avaria (ordem > avaria_apos_ordem)
+        if atribuicao_id:
+            cursor.execute('SELECT avaria_apos_ordem FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+            row_avaria = cursor.fetchone()
+            avaria_apos = (row_avaria[0] or 0) if row_avaria and row_avaria[0] is not None else 0
+            if avaria_apos is not None and avaria_apos >= 0:
+                proxima_ordem = max(proxima_ordem, avaria_apos + 1)
+        
         # Buscar dados do pedido e motorista para histórico
         tabela_pedido = 'pedidos_pendentes' if pedido_tipo == 'P' else 'pedidos_entregues'
         cursor.execute(f'SELECT * FROM {tabela_pedido} WHERE id = ?', (pedido_id,))
@@ -3839,10 +4192,8 @@ def atribuir_encomenda():
             ''', (pedido_id, pedido_tipo, vm_id_para_insert, data_associacao, proxima_ordem))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'ATRIBUIR_ENCOMENDA',
             f'Atribuir encomenda a {motorista[0]} ({motorista[1]}): {pedido.get("cliente", "")} - {pedido.get("local_carga", "")} - {pedido.get("material", "")}',
             json.dumps({
@@ -3857,7 +4208,7 @@ def atribuir_encomenda():
                 'nome_motorista': motorista[0],
                 'matricula': motorista[1]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3912,10 +4263,8 @@ def remover_atribuicao(atribuicao_id):
         cursor.execute('DELETE FROM encomenda_viatura WHERE id = ?', (atribuicao_id,))
         
         # Registar ação no histórico
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'REMOVER_ATRIBUICAO',
             f'Remover atribuição de encomenda: {cliente} - {local_carga} - {material} de {nome_motorista} ({matricula})',
             json.dumps({
@@ -3932,7 +4281,7 @@ def remover_atribuicao(atribuicao_id):
                 'nome_motorista': nome_motorista,
                 'matricula': matricula
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -3985,10 +4334,8 @@ def remover_atribuicao_por_pedido():
         if atribuicao and pedido:
             atribuicao_dict = dict(atribuicao) if atribuicao else {}
             pedido_dict = dict(pedido) if pedido else {}
-            cursor.execute('''
-                INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                VALUES (?, ?, ?)
-            ''', (
+            registar_historico_acao(
+                cursor,
                 'REMOVER_ATRIBUICAO',
                 f'Remover atribuição de encomenda: {pedido_dict.get("cliente", "")} - {pedido_dict.get("local_carga", "")} - {pedido_dict.get("material", "")} de {atribuicao_dict.get("nome_motorista", "")} ({atribuicao_dict.get("matricula", "")})',
                 json.dumps({
@@ -4004,7 +4351,7 @@ def remover_atribuicao_por_pedido():
                     'nome_motorista': atribuicao_dict.get('nome_motorista', ''),
                     'matricula': atribuicao_dict.get('matricula', '')
                 })
-            ))
+            )
         
         conn.commit()
         conn.close()
@@ -4096,10 +4443,8 @@ def mover_encomenda_motorista():
             atribuicao_antiga_dict = dict(atribuicao_antiga) if atribuicao_antiga else {}
             motorista_novo_dict = dict(motorista_novo) if motorista_novo else {}
             
-            cursor.execute('''
-                INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-                VALUES (?, ?, ?)
-            ''', (
+            registar_historico_acao(
+                cursor,
                 'MOVER_ENCOMENDA',
                 f'Mover encomenda: {pedido_dict.get("cliente", "")} - {atribuicao_antiga_dict.get("nome_motorista", "")} ({atribuicao_antiga_dict.get("matricula", "")}) → {motorista_novo_dict.get("nome_motorista", "")} ({motorista_novo_dict.get("matricula", "")})',
                 json.dumps({
@@ -4118,13 +4463,642 @@ def mover_encomenda_motorista():
                     'motorista_destino': motorista_novo_dict.get('nome_motorista', ''),
                     'matricula_destino': motorista_novo_dict.get('matricula', '')
                 })
-            ))
+            )
         
         conn.commit()
         conn.close()
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+def _toggle_encomenda_carregado_dia_anterior_impl():
+    """Implementação: marcar ou desmarcar encomenda como 'carregado no dia anterior'."""
+    data = request.json or {}
+    raw_id = data.get('encomenda_viatura_id')
+    marcar = data.get('marcar', True)
+    if raw_id is None:
+        return jsonify({'success': False, 'error': 'encomenda_viatura_id obrigatório'}), 400
+    try:
+        encomenda_viatura_id = int(raw_id)
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'encomenda_viatura_id inválido'}), 400
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        if marcar:
+            cursor.execute('''
+                INSERT OR IGNORE INTO encomenda_carregado_dia_anterior (encomenda_viatura_id)
+                VALUES (?)
+            ''', (encomenda_viatura_id,))
+        else:
+            cursor.execute('''
+                DELETE FROM encomenda_carregado_dia_anterior
+                WHERE encomenda_viatura_id = ?
+            ''', (encomenda_viatura_id,))
+        conn.commit()
+        return jsonify({'success': True, 'carregado_dia_anterior': marcar})
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        conn.close()
+
+
+@app.route('/api/encomenda-carregado-dia-anterior', methods=['POST'])
+def toggle_encomenda_carregado_dia_anterior():
+    """Marcar ou desmarcar encomenda (linha no card) como 'carregado no dia anterior'; mostra borda esquerda na encomenda."""
+    return _toggle_encomenda_carregado_dia_anterior_impl()
+
+
+@app.route('/api/card-carregado-dia-anterior', methods=['POST'])
+def toggle_card_carregado_dia_anterior_alias():
+    """Alias: aceita encomenda_viatura_id para compatibilidade (mesma lógica que encomenda-carregado-dia-anterior)."""
+    return _toggle_encomenda_carregado_dia_anterior_impl()
+
+
+def _construir_resumo_dia(data_str):
+    """Construir resumo do dia seguinte / dia do planeamento (motoristas, encomendas e análise) para email."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            SELECT 
+                a.id as atribuicao_id,
+                COALESCE(m.nome, m_h.nome, 'Não atribuído') as motorista_nome,
+                t.matricula as trator_matricula,
+                cis.matricula as cisterna_matricula,
+                COALESCE(a.avaria_alteracao, 0) as avaria_alteracao,
+                a.avaria_observacao as avaria_observacao
+            FROM conjuntos_habituais c
+            LEFT JOIN atribuicoes_motoristas a ON a.conjunto_id = c.id AND a.data_atribuicao = ?
+            LEFT JOIN tratores t ON c.trator_id = t.id
+            LEFT JOIN cisternas cis ON c.cisterna_id = cis.id
+            LEFT JOIN motoristas m ON COALESCE(a.motorista_id, c.motorista_id) = m.id
+            LEFT JOIN motoristas m_h ON c.motorista_id = m_h.id
+            WHERE c.ativo = 1
+            ORDER BY c.ordem ASC
+        ''', (data_str,))
+        rows = cursor.fetchall()
+        cards = []
+        total_encomendas = 0
+        encomendas_prioridade = 0
+        motoristas_com_avaria = 0
+        encomendas_carregado_dia_anterior = 0
+        cursor.execute('SELECT encomenda_viatura_id FROM encomenda_carregado_dia_anterior')
+        ids_carregado_ant = set(r[0] for r in cursor.fetchall())
+        for r in rows:
+            atrib = dict(r)
+            atribuicao_id = atrib.get('atribuicao_id')
+            matricula = '%s + %s' % (atrib.get('trator_matricula') or '', atrib.get('cisterna_matricula') or '')
+            matricula = matricula.strip(' +') or '—'
+            encomendas = []
+            if atribuicao_id:
+                cursor.execute('''
+                    SELECT ev.id, ev.pedido_id, ev.pedido_tipo, pp.cliente, pp.local_descarga, pp.local_carga, pp.material, pp.prioridade
+                    FROM encomenda_viatura ev
+                    LEFT JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
+                    WHERE ev.atribuicao_id = ? AND ev.data_associacao = ?
+                    ORDER BY COALESCE(ev.ordem, 999), ev.id
+                ''', (atribuicao_id, data_str))
+                ev_rows = cursor.fetchall()
+            else:
+                ev_rows = []
+            for e in ev_rows:
+                ed = dict(e)
+                ev_id = ed.get('id')
+                carregado_ant = ev_id in ids_carregado_ant if ev_id else False
+                if carregado_ant:
+                    encomendas_carregado_dia_anterior += 1
+                prioridade = (ed.get('prioridade') or 0) == 1
+                if prioridade:
+                    encomendas_prioridade += 1
+                encomendas.append({
+                    'cliente': (ed.get('cliente') or '').strip(),
+                    'local_descarga': (ed.get('local_descarga') or '').strip(),
+                    'local_carga': (ed.get('local_carga') or '').strip(),
+                    'material': (ed.get('material') or '').strip(),
+                    'prioridade': prioridade,
+                    'carregado_dia_anterior': carregado_ant,
+                })
+            total_encomendas += len(encomendas)
+            if atrib.get('avaria_alteracao'):
+                motoristas_com_avaria += 1
+            hora_inicio_cedo = None
+            if atribuicao_id:
+                cursor.execute('SELECT hora_inicio FROM motorista_inicio_cedo WHERE atribuicao_id = ?', (atribuicao_id,))
+                mic = cursor.fetchone()
+                if mic and (mic[0] or '').strip():
+                    hora_inicio_cedo = (mic[0] or '').strip()
+            cards.append({
+                'motorista_nome': (atrib.get('motorista_nome') or '').strip(),
+                'matricula': matricula,
+                'avaria_observacao': (atrib.get('avaria_observacao') or '').strip(),
+                'hora_inicio_cedo': hora_inicio_cedo,
+                'encomendas': encomendas,
+            })
+        # Análise de entregas e clientes (agregação por cliente, local de descarga, material)
+        from collections import defaultdict
+        por_cliente = defaultdict(int)
+        por_local_descarga = defaultdict(int)
+        por_material = defaultdict(int)
+        for card in cards:
+            for enc in (card.get('encomendas') or []):
+                cli = (enc.get('cliente') or '').strip() or '—'
+                loc = (enc.get('local_descarga') or '').strip() or (enc.get('local_carga') or '').strip() or '—'
+                mat = (enc.get('material') or '').strip() or '—'
+                por_cliente[cli] += 1
+                por_local_descarga[loc] += 1
+                por_material[mat] += 1
+        def top_n(d, n=15):
+            return sorted(d.items(), key=lambda x: -x[1])[:n]
+        analise_entregas = {
+            'clientes_unicos': len([k for k in por_cliente if k != '—']),
+            'top_clientes': top_n(por_cliente),
+            'top_locais_descarga': top_n(por_local_descarga),
+            'top_materiais': top_n(por_material),
+        }
+        conn.close()
+        from datetime import datetime
+        try:
+            dt = datetime.strptime(data_str, '%Y-%m-%d')
+            data_formatada = dt.strftime('%d/%m/%Y')
+        except Exception:
+            data_formatada = data_str
+        analise = {
+            'total_motoristas': len(cards),
+            'total_encomendas': total_encomendas,
+            'encomendas_prioridade': encomendas_prioridade,
+            'motoristas_com_avaria': motoristas_com_avaria,
+            'encomendas_carregado_dia_anterior': encomendas_carregado_dia_anterior,
+            'analise_entregas': analise_entregas,
+        }
+        return {
+            'data_str': data_str,
+            'data_formatada': data_formatada,
+            'analise': analise,
+            'cards': cards,
+        }
+    except Exception as e:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise e
+
+
+# Valores predefinidos SMTP (Pragosa) – usados se .env não carregar
+_SMTP_DEFAULT = {
+    'host': 'smtp.office365.com',
+    'port': 587,
+    'user': 'joao.gaspar@pragosa.pt',
+    'password': 'Leiria2026',
+}
+
+
+def _carregar_env_email():
+    """Carregar SMTP e EMAIL_RESUMO_DESTINO do ficheiro .env na pasta do app (fallback manual)."""
+    env_path = os.path.join(_BASE_DIR, '.env')
+    if not os.path.isfile(env_path):
+        return
+    try:
+        with open(env_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, val = line.partition('=')
+                    key, val = key.strip(), val.strip().strip('"\'')
+                    if key in ('SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'EMAIL_FROM', 'EMAIL_RESUMO_DESTINO',
+                               'GRAPH_TENANT_ID', 'GRAPH_CLIENT_ID', 'GRAPH_CLIENT_SECRET', 'GRAPH_SEND_AS',
+                               'RESEND_API_KEY') and val:
+                        os.environ[key] = val
+    except Exception:
+        pass
+
+
+def _enviar_email_resend(destinatarios, assunto, corpo_texto, corpo_html=None):
+    """Enviar email via Resend.com por SMTP (evita bloqueio Cloudflare 1010 da API HTTP)."""
+    import smtplib
+    import ssl
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    api_key = (os.environ.get('RESEND_API_KEY') or '').strip()
+    if not api_key:
+        raise ValueError(
+            'Defina RESEND_API_KEY no .env. Obtenha a chave em https://resend.com (conta grátis, 3000 emails/mês).'
+        )
+    from_addr = 'onboarding@resend.dev'
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = assunto
+    msg['From'] = from_addr
+    msg['To'] = ', '.join(destinatarios)
+    msg.attach(MIMEText(corpo_texto or '', 'plain', 'utf-8'))
+    if corpo_html:
+        msg.attach(MIMEText(corpo_html, 'html', 'utf-8'))
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP('smtp.resend.com', 587, timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login('resend', api_key)
+            server.sendmail(from_addr, destinatarios, msg.as_string())
+    except smtplib.SMTPAuthenticationError as e:
+        raise ValueError('Resend SMTP: chave API inválida ou expirada. Verifique RESEND_API_KEY no .env.')
+    except Exception as e:
+        raise ValueError('Resend SMTP: %s' % str(e))
+
+
+def _enviar_email_graph(destinatarios, assunto, corpo_texto, corpo_html=None):
+    """Enviar email via Microsoft Graph API (funciona com SMTP AUTH desativado no Office 365)."""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+    import ssl
+    import json as _json
+    tenant = (os.environ.get('GRAPH_TENANT_ID') or '').strip()
+    client_id = (os.environ.get('GRAPH_CLIENT_ID') or '').strip()
+    client_secret = (os.environ.get('GRAPH_CLIENT_SECRET') or '').strip()
+    send_as = (os.environ.get('GRAPH_SEND_AS') or os.environ.get('SMTP_USER') or 'joao.gaspar@pragosa.pt').strip()
+    if not tenant or not client_id or not client_secret:
+        raise ValueError(
+            'Para usar Microsoft Graph defina no .env: GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET. '
+            'Opcional: GRAPH_SEND_AS (email que envia; default joao.gaspar@pragosa.pt).'
+        )
+    body_content = (corpo_html or corpo_texto or '').replace('\n', '<br>\n')
+    if not body_content.strip():
+        body_content = corpo_texto or ''
+    payload = {
+        'message': {
+            'subject': assunto,
+            'body': {'contentType': 'HTML', 'content': body_content},
+            'toRecipients': [{'emailAddress': {'address': addr}} for addr in destinatarios]
+        },
+        'saveToSentItems': True
+    }
+    token_url = 'https://login.microsoftonline.com/%s/oauth2/v2.0/token' % tenant
+    token_data = (
+        'grant_type=client_credentials'
+        + '&client_id=' + urllib.parse.quote(client_id, safe='')
+        + '&client_secret=' + urllib.parse.quote(client_secret, safe='')
+        + '&scope=' + urllib.parse.quote('https://graph.microsoft.com/.default', safe='')
+    ).encode('utf-8')
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(token_url, data=token_data, method='POST', headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            token_res = _json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        err_body = (e.read().decode() if e.fp else '') or ''
+        raise ValueError('Erro ao obter token Graph: %s %s' % (e.code, err_body[:200]))
+    access_token = token_res.get('access_token')
+    if not access_token:
+        raise ValueError('Resposta do Graph sem access_token: %s' % str(token_res)[:200])
+    send_url = 'https://graph.microsoft.com/v1.0/users/%s/sendMail' % urllib.parse.quote(send_as, safe='')
+    req = urllib.request.Request(send_url, data=_json.dumps(payload).encode('utf-8'), method='POST',
+                                 headers={'Authorization': 'Bearer ' + access_token, 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            pass
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode() if e.fp else ''
+        raise ValueError('Erro Graph ao enviar email: %s %s' % (e.code, err_body[:300]))
+
+
+def _enviar_email_smtp(destinatarios, assunto, corpo_texto, corpo_html=None):
+    """Enviar email via SMTP. Usa variáveis de ambiente ou valores predefinidos."""
+    import smtplib
+    import ssl
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    host = (os.environ.get('SMTP_HOST') or _SMTP_DEFAULT.get('host') or '').strip()
+    port_str = (os.environ.get('SMTP_PORT') or str(_SMTP_DEFAULT.get('port', 587)) or '587').strip()
+    port = int(port_str) if port_str.isdigit() else 587
+    user = (os.environ.get('SMTP_USER') or _SMTP_DEFAULT.get('user') or '').strip()
+    password = (os.environ.get('SMTP_PASSWORD') or _SMTP_DEFAULT.get('password') or '').strip()
+    from_addr = (os.environ.get('EMAIL_FROM') or user or 'noreply@localhost').strip()
+    if not host or not user:
+        raise ValueError(
+            'Configuração de email em falta. Defina SMTP_HOST e SMTP_USER (e SMTP_PASSWORD) no ficheiro .env na pasta do projeto.'
+        )
+    if not password:
+        raise ValueError(
+            'SMTP_PASSWORD está vazio. Adicione a password em .env ou verifique a configuração.'
+        )
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = assunto
+    msg['From'] = from_addr
+    msg['To'] = ', '.join(destinatarios)
+    msg.attach(MIMEText(corpo_texto, 'plain', 'utf-8'))
+    if corpo_html:
+        msg.attach(MIMEText(corpo_html, 'html', 'utf-8'))
+    context = ssl.create_default_context()
+    try:
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.ehlo()
+            server.starttls(context=context)
+            server.ehlo()
+            server.login(user, password)
+            server.sendmail(from_addr, destinatarios, msg.as_string())
+    except smtplib.SMTPAuthenticationError as e:
+        err_str = str(e).lower()
+        if 'smtpclientauthentication is disabled' in err_str or '5.7.139' in err_str:
+            raise ValueError(
+                'O Office 365 tem SMTP desativado. Solução: crie conta em https://resend.com (grátis), '
+                'obtenha uma API Key e no .env defina RESEND_API_KEY=re_xxx. O email continuará a ir para joao.gaspar@pragosa.pt.'
+            )
+        raise ValueError(
+            'Falha de autenticação SMTP. Verifique SMTP_USER e SMTP_PASSWORD no .env. Detalhe: %s' % str(e)
+        )
+    except Exception as e:
+        raise ValueError('Erro ao enviar email: %s' % str(e))
+
+
+def _gerar_graficos_resumo_base64(resumo):
+    """Gera gráficos do resumo como imagens PNG em base64 (para HTML). Retorna dict com 'barras' e 'pie' ou {} se matplotlib não disponível."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import base64
+        from io import BytesIO
+    except ImportError:
+        return {}
+    a = resumo['analise']
+    cards = resumo.get('cards') or []
+    ae = a.get('analise_entregas') or {}
+    top_clientes = [(n, c) for n, c in (ae.get('top_clientes') or []) if n != '—']
+    out = {}
+    try:
+        # Gráfico: top clientes (encomendas por cliente)
+        if top_clientes:
+            top10 = top_clientes[:10]
+            nomes = [n[:25] for n, _ in top10]
+            vals = [c for _, c in top10]
+            fig, ax = plt.subplots(figsize=(6, max(2.5, len(nomes) * 0.4)))
+            ax.barh(nomes, vals, color='#0d9488', edgecolor='#0f766e', linewidth=0.8)
+            ax.set_xlabel('Nº encomendas')
+            ax.set_title('Top clientes (entregas)')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            buf = BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+            plt.close()
+            out['clientes'] = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+        # Gráfico de barras: encomendas por motorista
+        if cards:
+            nomes = [(c.get('motorista_nome') or 'N/A')[:20] for c in cards]
+            totals = [len(c.get('encomendas') or []) for c in cards]
+            fig, ax = plt.subplots(figsize=(6, max(3, len(cards) * 0.35)))
+            bars = ax.barh(nomes, totals, color='#2563eb', edgecolor='#1e40af', linewidth=0.8)
+            ax.set_xlabel('Nº encomendas')
+            ax.set_title('Encomendas por motorista')
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            buf = BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+            plt.close()
+            out['barras'] = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+        # Gráfico circular: prioridade vs normal, carregado dia ant., avaria
+        if a.get('total_encomendas', 0) > 0 or a.get('motoristas_com_avaria', 0) > 0:
+            labels, sizes, colors = [], [], []
+            if a.get('encomendas_prioridade', 0) > 0:
+                labels.append('Prioridade')
+                sizes.append(a['encomendas_prioridade'])
+                colors.append('#dc2626')
+            normais = (a.get('total_encomendas') or 0) - (a.get('encomendas_prioridade') or 0)
+            if normais > 0:
+                labels.append('Normal')
+                sizes.append(normais)
+                colors.append('#16a34a')
+            if a.get('encomendas_carregado_dia_anterior', 0) > 0:
+                labels.append('Carreg. dia ant.')
+                sizes.append(a['encomendas_carregado_dia_anterior'])
+                colors.append('#0891b2')
+            if a.get('motoristas_com_avaria', 0) > 0:
+                labels.append('Cards c/ avaria')
+                sizes.append(a['motoristas_com_avaria'])
+                colors.append('#ca8a04')
+            if labels and sizes:
+                fig, ax = plt.subplots(figsize=(4, 4))
+                ax.pie(sizes, labels=labels, colors=colors[:len(labels)], autopct='%1.0f%%', startangle=90)
+                ax.set_title('Resumo do dia')
+                buf = BytesIO()
+                plt.tight_layout()
+                plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+                plt.close()
+                out['pie'] = 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        print('Erro ao gerar gráficos resumo:', e)
+    return out
+
+
+def _construir_corpos_resumo(resumo):
+    """A partir do dict resumo, devolve (corpo_texto, corpo_html) para email ou ficheiro. HTML profissional com gráficos."""
+    a = resumo['analise']
+    ae = a.get('analise_entregas') or {}
+    top_clientes = ae.get('top_clientes') or []
+    top_locais = ae.get('top_locais_descarga') or []
+    top_materiais = ae.get('top_materiais') or []
+    clientes_unicos = ae.get('clientes_unicos') or 0
+
+    # Texto simples: foco em 3-4 frases de leitura rápida, não em listas enormes
+    linhas = [
+        'RESUMO DO DIA SEGUINTE (PLANEAMENTO) — %s' % resumo['data_formatada'],
+        '',
+        '——— ANÁLISE BREVE DO DIA ———',
+        '• Total de motoristas: %d  |  Total de encomendas: %d' % (a['total_motoristas'], a['total_encomendas']),
+        '• Encomendas com prioridade: %d  |  Carreg. dia anterior: %d  |  Cards c/ avaria: %d' % (a['encomendas_prioridade'], a['encomendas_carregado_dia_anterior'], a['motoristas_com_avaria']),
+        '',
+        '——— ANÁLISE DE ENTREGAS E CLIENTES ———',
+        '• Clientes únicos com encomendas: %d' % clientes_unicos,
+    ]
+    if top_clientes:
+        nome, cnt = top_clientes[0]
+        if nome != '—':
+            linhas.append('• Cliente com mais encomendas: %s (%d encomendas)' % (nome, cnt))
+    if top_locais:
+        local, cnt = top_locais[0]
+        if local != '—':
+            linhas.append('• Local de descarga mais usado: %s (%d encomendas)' % (local, cnt))
+    if top_materiais:
+        mat, cnt = top_materiais[0]
+        if mat != '—':
+            linhas.append('• Material mais carregado: %s (%d encomendas)' % (mat, cnt))
+    linhas.extend(['', '——— DETALHE POR MOTORISTA ———', ''])
+    for card in resumo['cards']:
+        hic = (card.get('hora_inicio_cedo') or '').strip()
+        suf = ' (Hora de saída: %s)' % ('5h' if hic == '05:00' else '6h') if hic in ('05:00', '06:00') else ''
+        linhas.append('%s — %s%s' % (card['motorista_nome'], card['matricula'], suf))
+        if card.get('avaria_observacao'):
+            linhas.append('  Avaria/Alteração: %s' % card['avaria_observacao'])
+        for enc in card['encomendas']:
+            prio = ' [PRIORIDADE]' if enc.get('prioridade') else ''
+            carg = ' (carreg. dia ant.)' if enc.get('carregado_dia_anterior') else ''
+            linhas.append('  • %s | %s | %s%s%s' % (
+                (enc.get('cliente') or enc.get('local_descarga') or '—'),
+                (enc.get('local_descarga') or enc.get('local_carga') or '—'),
+                (enc.get('material') or '—'),
+                prio, carg
+            ))
+        linhas.append('')
+    corpo_texto = '\n'.join(linhas)
+
+    graficos = _gerar_graficos_resumo_base64(resumo)
+    css = (
+        'body{font-family:Segoe UI,Helvetica,Arial,sans-serif;margin:0;padding:24px;background:#f8fafc;color:#1e293b;}'
+        '.wrap{max-width:720px;margin:0 auto;background:#fff;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,.08);overflow:hidden;}'
+        '.head{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:#fff;padding:24px 28px;}'
+        '.head h1{margin:0;font-size:22px;font-weight:600;}'
+        '.head .date{opacity:.9;font-size:14px;margin-top:6px;}'
+        '.sect{padding:20px 28px;border-bottom:1px solid #e2e8f0;}'
+        '.sect:last-child{border-bottom:0;}'
+        '.sect h2{margin:0 0 16px 0;font-size:16px;color:#0f172a;}'
+        '.kpis{display:table;width:100%;table-layout:fixed;}'
+        '.kpi{display:table-cell;text-align:center;padding:12px;background:#f1f5f9;border-radius:8px;margin:4px;}'
+        '.kpi .v{font-size:24px;font-weight:700;color:#0f172a;}'
+        '.kpi .l{font-size:12px;color:#64748b;margin-top:4px;}'
+        'table.det{border-collapse:collapse;width:100%;font-size:13px;}'
+        'table.det th{text-align:left;padding:10px 12px;background:#f1f5f9;color:#475569;}'
+        'table.det td{padding:10px 12px;border-bottom:1px solid #e2e8f0;}'
+        'table.det tr:nth-child(even){background:#fafafa;}'
+        '.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;}'
+        '.badge-prio{background:#fef2f2;color:#b91c1c;}'
+        '.badge-ant{background:#ecfdf5;color:#047857;}'
+        '.chart{text-align:center;margin:16px 0;}'
+        '.chart img{max-width:100%;height:auto;border-radius:8px;}'
+    )
+    html_parts = [
+        '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+        '<title>Resumo planeamento — %s</title><style>%s</style></head><body><div class="wrap">' % (resumo['data_formatada'], css),
+        '<div class="head"><h1>Resumo do dia seguinte (planeamento)</h1><div class="date">%s</div></div>' % resumo['data_formatada'],
+        '<div class="sect"><h2>Análise do dia</h2>',
+        '<div class="kpis">',
+        '<div class="kpi"><div class="v">%d</div><div class="l">Motoristas</div></div>' % a['total_motoristas'],
+        '<div class="kpi"><div class="v">%d</div><div class="l">Encomendas</div></div>' % a['total_encomendas'],
+        '<div class="kpi"><div class="v">%d</div><div class="l">Prioridade</div></div>' % a['encomendas_prioridade'],
+        '<div class="kpi"><div class="v">%d</div><div class="l">Carreg. dia ant.</div></div>' % a['encomendas_carregado_dia_anterior'],
+        '<div class="kpi"><div class="v">%d</div><div class="l">Cards c/ avaria</div></div>' % a['motoristas_com_avaria'],
+        '</div></div>',
+    ]
+    # Análise de entregas e clientes – transformar dados soltos em 3-4 frases
+    html_parts.append('<div class="sect"><h2>Análise de entregas e clientes</h2>')
+    html_parts.append('<p><strong>Clientes únicos com encomendas:</strong> %d</p>' % clientes_unicos)
+    html_parts.append('<ul>')
+    if top_clientes:
+        nome, cnt = top_clientes[0]
+        if nome != '—':
+            html_parts.append('<li>Cliente com mais encomendas: <strong>%s</strong> (%d encomendas)</li>' % (
+                nome.replace('<', '&lt;').replace('>', '&gt;'),
+                cnt
+            ))
+    if top_locais:
+        local, cnt = top_locais[0]
+        if local != '—':
+            html_parts.append('<li>Local de descarga mais usado: <strong>%s</strong> (%d encomendas)</li>' % (
+                local.replace('<', '&lt;').replace('>', '&gt;'),
+                cnt
+            ))
+    if top_materiais:
+        mat, cnt = top_materiais[0]
+        if mat != '—':
+            html_parts.append('<li>Material mais carregado: <strong>%s</strong> (%d encomendas)</li>' % (
+                mat.replace('<', '&lt;').replace('>', '&gt;'),
+                cnt
+            ))
+    html_parts.append('</ul></div>')
+    if graficos:
+        html_parts.append('<div class="sect"><h2>Gráficos</h2>')
+        if graficos.get('clientes'):
+            html_parts.append('<div class="chart"><img src="%s" alt="Top clientes" style="max-width:480px;"></div>' % graficos['clientes'])
+        if graficos.get('barras'):
+            html_parts.append('<div class="chart"><img src="%s" alt="Encomendas por motorista" style="max-width:480px;"></div>' % graficos['barras'])
+        if graficos.get('pie'):
+            html_parts.append('<div class="chart"><img src="%s" alt="Resumo" style="max-width:280px;"></div>' % graficos['pie'])
+        html_parts.append('</div>')
+    html_parts.append('<div class="sect"><h2>Detalhe por motorista</h2><table class="det"><thead><tr><th>Motorista</th><th>Matrícula</th><th>Hora de saída</th><th>Encomendas</th></tr></thead><tbody>')
+    for card in resumo['cards']:
+        enc_cells = []
+        for enc in (card.get('encomendas') or []):
+            prio = ' <span class="badge badge-prio">PRIO</span>' if enc.get('prioridade') else ''
+            carg = ' <span class="badge badge-ant">dia ant.</span>' if enc.get('carregado_dia_anterior') else ''
+            enc_cells.append('%s | %s | %s%s%s' % (
+                (enc.get('cliente') or enc.get('local_descarga') or '—'),
+                (enc.get('local_descarga') or enc.get('local_carga') or '—'),
+                (enc.get('material') or '—'),
+                prio, carg
+            ))
+        avaria = ('<br><em>Avaria: %s</em>' % (card.get('avaria_observacao') or '').replace('<', '&lt;').replace('>', '&gt;')) if card.get('avaria_observacao') else ''
+        hi = (card.get('hora_inicio_cedo') or '').strip()
+        hora_saida_cell = ('<strong>%s</strong>' % ('5h' if hi == '05:00' else '6h')) if hi in ('05:00', '06:00') else '—'
+        html_parts.append('<tr><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+            (card.get('motorista_nome') or '—'),
+            avaria,
+            (card.get('matricula') or '—'),
+            hora_saida_cell,
+            '<br>'.join(enc_cells) if enc_cells else '—'
+        ))
+    html_parts.append('</tbody></table></div></div></body></html>')
+    corpo_html = ''.join(html_parts)
+    return corpo_texto, corpo_html
+
+
+@app.route('/api/resumo-dia-download', methods=['GET'])
+def resumo_dia_download():
+    """Descarregar resumo do dia seguinte como ficheiro HTML (funciona sem SMTP)."""
+    try:
+        data_str = (request.args.get('data') or date.today().isoformat()).strip()
+        resumo = _construir_resumo_dia(data_str)
+        corpo_texto, corpo_html = _construir_corpos_resumo(resumo)
+        from flask import Response
+        response = Response(corpo_html.encode('utf-8'), mimetype='text/html; charset=utf-8')
+        response.headers['Content-Disposition'] = 'attachment; filename="resumo_%s.html"' % data_str
+        return response
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/enviar-resumo-dia', methods=['POST'])
+def enviar_resumo_dia():
+    """Enviar por email o resumo do dia seguinte / dia do planeamento (com breve análise). Acionado por botão no frontend."""
+    try:
+        _carregar_env_email()  # garantir que .env foi lido (pasta do app)
+        data = request.json or {}
+        data_str = (data.get('data') or date.today().isoformat()).strip()
+        destinatarios = data.get('destinatarios') or []
+        if not destinatarios and os.environ.get('EMAIL_RESUMO_DESTINO'):
+            dest_str = os.environ.get('EMAIL_RESUMO_DESTINO', '').strip()
+            destinatarios = [e.strip() for e in dest_str.split(',') if e.strip()]
+        if not destinatarios:
+            destinatarios = ['joao.gaspar@pragosa.pt']  # destinatário predefinido
+        resumo = _construir_resumo_dia(data_str)
+        corpo_texto, corpo_html = _construir_corpos_resumo(resumo)
+        assunto = 'Resumo do dia seguinte (planeamento) — %s' % resumo['data_formatada']
+        resend_key = (os.environ.get('RESEND_API_KEY') or '').strip()
+        tenant = (os.environ.get('GRAPH_TENANT_ID') or '').strip()
+        client_id = (os.environ.get('GRAPH_CLIENT_ID') or '').strip()
+        client_secret = (os.environ.get('GRAPH_CLIENT_SECRET') or '').strip()
+        if resend_key:
+            _enviar_email_resend(destinatarios, assunto, corpo_texto, corpo_html)
+        elif tenant and client_id and client_secret:
+            _enviar_email_graph(destinatarios, assunto, corpo_texto, corpo_html)
+        else:
+            _enviar_email_smtp(destinatarios, assunto, corpo_texto, corpo_html)
+        return jsonify({'success': True, 'message': 'Resumo do dia seguinte enviado por email com sucesso.'})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/apagar-card-dia', methods=['POST'])
 def apagar_card_dia():
@@ -4234,10 +5208,8 @@ def apagar_card_dia():
             card_desativado = False
         
         # Registar ação no histórico (antes do commit)
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (
+        registar_historico_acao(
+            cursor,
             'APAGAR_CARD_DIA',
             f'Apagar card do dia: {motorista[2]} ({motorista[1]}) - {data_associacao}',
             json.dumps({
@@ -4247,7 +5219,7 @@ def apagar_card_dia():
                 'matricula': motorista[1],
                 'nome_motorista': motorista[2]
             })
-        ))
+        )
         
         conn.commit()
         conn.close()
@@ -4347,20 +5319,21 @@ def exportar_wialong():
         cursor = conn.cursor()
         
         # Buscar todas as viaturas com encomendas atribuídas para a data
+        # Sequência para Wialong: Local de descarga - Local de carga - Material
         cursor.execute('''
             SELECT 
                 vm.id as viatura_motorista_id,
                 vm.matricula,
                 vm.codigo,
                 vm.nome_motorista,
-                pp.cliente,
+                COALESCE(pp.local_descarga, pp.cliente, '') as local_descarga,
                 pp.local_carga,
                 pp.material
             FROM encomenda_viatura ev
             INNER JOIN viatura_motorista vm ON ev.viatura_motorista_id = vm.id
             INNER JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
             WHERE ev.data_associacao = ?
-            ORDER BY vm.matricula ASC, pp.cliente ASC
+            ORDER BY vm.matricula ASC, pp.local_descarga ASC
         ''', (data_planeamento,))
         
         dados_raw = cursor.fetchall()
@@ -4687,9 +5660,17 @@ def get_historico_entregas():
                 vm.matricula || ' + ' || vm.codigo || ' - ' || vm.nome_motorista as viatura_motorista,
                 COALESCE(pp.cliente, pe.cliente, '') as cliente,
                 COALESCE(pp.local_carga, pe.local_carga, '') as local_carga,
-                COALESCE(pp.material, pe.material, '') as material
+                COALESCE(pp.local_descarga, pe.local_descarga, '') as local_descarga,
+                COALESCE(pp.material, pe.material, '') as material,
+                COALESCE(pp.observacoes, pe.observacoes, '') as observacoes,
+                COALESCE(ev.ordem, 999999) as ev_ordem,
+                a.avaria_apos_ordem as avaria_apos_ordem,
+                COALESCE(a.avaria_alteracao, 0) as avaria_alteracao,
+                a.avaria_observacao as avaria_observacao,
+                a.avaria_nota as avaria_nota
             FROM encomenda_viatura ev
             INNER JOIN viatura_motorista vm ON ev.viatura_motorista_id = vm.id
+            LEFT JOIN atribuicoes_motoristas a ON ev.atribuicao_id = a.id
             LEFT JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
             LEFT JOIN pedidos_entregues pe ON ev.pedido_tipo = 'E' AND ev.pedido_id = pe.id
             WHERE (pp.id IS NOT NULL OR pe.id IS NOT NULL)
@@ -4709,7 +5690,7 @@ def get_historico_entregas():
         if not data_inicio and not data_fim:
             query += ' AND ev.data_associacao >= date(\'now\', \'-30 days\')'
         
-        query += ' ORDER BY ev.data_associacao DESC, vm.matricula ASC'
+        query += ' ORDER BY ev.data_associacao DESC, ev.atribuicao_id ASC, COALESCE(ev.ordem, 999999) ASC'
         
         if params:
             cursor.execute(query, tuple(params))
@@ -4737,8 +5718,8 @@ def get_historico_entregas():
             data_assoc = (row_dict.get('data_associacao') or 
                          row_dict.get('data') or '')
             
-            local_carga = (row_dict.get('local_carga') or 
-                          row_dict.get('local_descarga') or '')
+            local_carga = (row_dict.get('local_carga') or '')
+            local_descarga = (row_dict.get('local_descarga') or '')
             
             # Converter data para string
             if data_assoc:
@@ -4754,13 +5735,36 @@ def get_historico_entregas():
             else:
                 data_assoc = ''
             
-            # Garantir que sempre retornamos com os nomes corretos que o frontend espera
+            # Avaria no histórico: só mostrar nas encomendas APÓS a avaria (troca de matrícula)
+            # avaria_apos_ordem = N significa que a avaria foi após as primeiras N encomendas; só as seguintes (ordem > N) devem mostrar a avaria
+            ev_ordem = row_dict.get('ev_ordem')
+            avaria_apos = row_dict.get('avaria_apos_ordem')
+            try:
+                ev_ordem = int(ev_ordem) if ev_ordem is not None else 999999
+            except (TypeError, ValueError):
+                ev_ordem = 999999
+            try:
+                avaria_apos = int(avaria_apos) if avaria_apos is not None else None
+            except (TypeError, ValueError):
+                avaria_apos = None
+            mostra_avaria = bool(row_dict.get('avaria_alteracao') or 0) and avaria_apos is not None and ev_ordem > avaria_apos
+            if mostra_avaria:
+                avaria_obs = (row_dict.get('avaria_observacao') or '').strip()
+                avaria_nota = (row_dict.get('avaria_nota') or '').strip()
+            else:
+                avaria_obs = ''
+                avaria_nota = ''
             historico.append({
                 'data_associacao': data_assoc,
                 'viatura_motorista': row_dict.get('viatura_motorista', '') or '',
                 'cliente': row_dict.get('cliente', '') or '',
                 'local_carga': local_carga,
-                'material': row_dict.get('material', '') or ''
+                'local_descarga': local_descarga,
+                'material': row_dict.get('material', '') or '',
+                'observacoes': row_dict.get('observacoes', '') or '',
+                'avaria_alteracao': mostra_avaria,
+                'avaria_observacao': avaria_obs,
+                'avaria_nota': avaria_nota
             })
         
         print(f"DEBUG - Total de registros processados: {len(historico)}")
@@ -5304,7 +6308,7 @@ def get_historico_alteracoes():
         
         # Buscar todas as ações, ordenadas por data mais recente
         cursor.execute('''
-            SELECT id, tipo_acao, descricao, dados_acao, data_acao, revertido
+            SELECT id, tipo_acao, descricao, dados_acao, data_acao, revertido, user_nome, user_id
             FROM historico_acoes
             ORDER BY data_acao DESC
             LIMIT 200
@@ -5318,7 +6322,9 @@ def get_historico_alteracoes():
                 'descricao': row[2],
                 'dados_acao': row[3],
                 'data_acao': row[4],
-                'revertido': bool(row[5])
+                'revertido': bool(row[5]),
+                'user_nome': row[6],
+                'user_id': row[7]
             })
         
         conn.close()
@@ -5654,6 +6660,58 @@ def reverter_acao(acao_id):
                 VALUES (?, ?, ?, ?, ?)
             ''', (pedido_id, pedido_tipo, viatura_motorista_id, data_associacao, ordem))
         
+        elif tipo_acao == 'DISPONIBILIDADE_FORCADA':
+            # Reverter: repor o status anterior (Férias/Baixa/OutrosTrabalhos) no dia
+            if not ja_foi_revertido:
+                viatura_motorista_id = dados_json.get('viatura_motorista_id')
+                data_status = dados_json.get('data_status')
+                status_anterior = dados_json.get('status_anterior')
+                data_inicio_anterior = dados_json.get('data_inicio_anterior')
+                data_fim_anterior = dados_json.get('data_fim_anterior')
+                if viatura_motorista_id and data_status and status_anterior:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO viatura_motorista_status
+                        (viatura_motorista_id, data_status, status, observacao_status, data_inicio, data_fim, updated_at)
+                        VALUES (?, ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (viatura_motorista_id, data_status, status_anterior, data_inicio_anterior, data_fim_anterior))
+            else:
+                # Reverter novamente: voltar a Disponivel (remover o status do dia)
+                viatura_motorista_id = dados_json.get('viatura_motorista_id')
+                data_status = dados_json.get('data_status')
+                if viatura_motorista_id and data_status:
+                    cursor.execute('''
+                        DELETE FROM viatura_motorista_status
+                        WHERE viatura_motorista_id = ? AND data_status = ?
+                    ''', (viatura_motorista_id, data_status))
+        
+        elif tipo_acao == 'DESATIVAR_CARD_DATA_ATUAL':
+            # Reverter: limpar data_desativacao e repor encomendas futuras que tinham sido removidas
+            if not ja_foi_revertido:
+                viatura_motorista_id = dados_json.get('viatura_motorista_id')
+                encomendas_removidas = dados_json.get('encomendas_removidas', [])
+                cursor.execute('UPDATE viatura_motorista SET data_desativacao = NULL WHERE id = ?', (viatura_motorista_id,))
+                for encomenda in encomendas_removidas:
+                    cursor.execute('''
+                        SELECT id FROM encomenda_viatura
+                        WHERE pedido_id = ? AND pedido_tipo = ? AND viatura_motorista_id = ? AND data_associacao = ?
+                    ''', (encomenda.get('pedido_id'), encomenda.get('pedido_tipo'), viatura_motorista_id, encomenda.get('data_associacao')))
+                    if not cursor.fetchone():
+                        cursor.execute('''
+                            INSERT INTO encomenda_viatura (pedido_id, pedido_tipo, viatura_motorista_id, data_associacao, ordem)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (encomenda.get('pedido_id'), encomenda.get('pedido_tipo'), viatura_motorista_id, encomenda.get('data_associacao'), encomenda.get('ordem', 0)))
+            else:
+                # Reverter novamente: voltar a desativar (remover encomendas futuras e marcar data_desativacao)
+                viatura_motorista_id = dados_json.get('viatura_motorista_id')
+                data_desativacao = dados_json.get('data_desativacao', date.today().isoformat())
+                encomendas_removidas = dados_json.get('encomendas_removidas', [])
+                cursor.execute('UPDATE viatura_motorista SET data_desativacao = ? WHERE id = ?', (data_desativacao, viatura_motorista_id))
+                for encomenda in encomendas_removidas:
+                    cursor.execute('''
+                        DELETE FROM encomenda_viatura
+                        WHERE pedido_id = ? AND pedido_tipo = ? AND viatura_motorista_id = ? AND data_associacao = ?
+                    ''', (encomenda.get('pedido_id'), encomenda.get('pedido_tipo'), viatura_motorista_id, encomenda.get('data_associacao')))
+        
         # Toggle do estado revertido (permite reverter múltiplas vezes)
         novo_estado_revertido = 0 if ja_foi_revertido else 1
         cursor.execute('''
@@ -5677,12 +6735,7 @@ def registrar_acao(tipo_acao, descricao, dados):
     try:
         conn = get_db()
         cursor = conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO historico_acoes (tipo_acao, descricao, dados_acao)
-            VALUES (?, ?, ?)
-        ''', (tipo_acao, descricao, json.dumps(dados)))
-        
+        registar_historico_acao(cursor, tipo_acao, descricao, json.dumps(dados))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -5760,17 +6813,25 @@ def get_servico_dia_anterior(viatura_id):
 
 @app.route('/api/viatura-motorista/<int:viatura_id>/ultimo-servico', methods=['GET'])
 def get_ultimo_servico(viatura_id):
-    """Obter o último dia em que a viatura/motorista teve serviço atribuído (anterior à data atual)"""
+    """Obter o último dia em que a viatura/motorista teve serviço atribuído (anterior a uma data de referência)."""
     try:
-        from datetime import date
+        from datetime import date, datetime
         
-        data_atual = date.today()
-        data_atual_str = data_atual.isoformat()
+        # Permitir passar uma data de referência (?data_ref=AAAA-MM-DD); se não for passada, usar hoje
+        data_ref_str = request.args.get('data_ref')
+        if data_ref_str:
+            try:
+                data_ref = datetime.strptime(data_ref_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                data_ref = date.today()
+        else:
+            data_ref = date.today()
+        data_ref_iso = data_ref.isoformat()
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Buscar a última data em que houve serviço atribuído (anterior à data atual)
+        # Buscar a última data em que houve serviço atribuído (anterior à data de referência)
         cursor.execute('''
             SELECT 
                 ev.data_associacao,
@@ -5780,7 +6841,7 @@ def get_ultimo_servico(viatura_id):
             GROUP BY ev.data_associacao
             ORDER BY ev.data_associacao DESC
             LIMIT 1
-        ''', (viatura_id, data_atual_str))
+        ''', (viatura_id, data_ref_iso))
         
         ultima_data = cursor.fetchone()
         
@@ -5837,89 +6898,114 @@ def get_ultimo_servico(viatura_id):
 
 @app.route('/api/atribuicao/<int:atribuicao_id>/ultimo-servico', methods=['GET'])
 def get_ultimo_servico_atribuicao(atribuicao_id):
-    """Obter o último dia em que o conjunto (atribuição) teve serviço atribuído (anterior à data atual)"""
+    """data_ref: data de referência. ultimo_dia_com_servico=1: último dia com trabalho; senão: dia anterior (data_ref-1)."""
     try:
-        from datetime import date
+        from datetime import date, datetime, timedelta
         
-        data_atual = date.today()
-        data_atual_str = data_atual.isoformat()
+        data_ref_str = (request.args.get('data_ref') or '').strip()
+        if data_ref_str:
+            try:
+                data_ref = datetime.strptime(data_ref_str, '%Y-%m-%d').date()
+            except (ValueError, TypeError):
+                try:
+                    data_ref = datetime.strptime(data_ref_str, '%d/%m/%Y').date()
+                except (ValueError, TypeError):
+                    data_ref = date.today()
+        else:
+            data_ref = date.today()
+        data_ref_iso = data_ref.isoformat()
+        
+        usar_ultimo_dia_com_servico = request.args.get('ultimo_dia_com_servico', '').strip() in ('1', 'true', 'yes')
         
         conn = get_db()
         cursor = conn.cursor()
         
-        # Obter conjunto_id da atribuição
         cursor.execute('SELECT conjunto_id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
         atribuicao_row = cursor.fetchone()
         
         if not atribuicao_row:
             conn.close()
-            return jsonify({
-                'data': None,
-                'encomendas': []
-            })
+            return jsonify({'data': None, 'encomendas': []})
         
         conjunto_id = atribuicao_row[0]
         
-        # Buscar a última data em que houve serviço atribuído a este conjunto (anterior à data atual)
-        # Usar atribuicao_id ou conjunto_id para encontrar encomendas
         cursor.execute('''
-            SELECT 
-                ev.data_associacao,
-                COUNT(*) as total_encomendas
-            FROM encomenda_viatura ev
-            WHERE (ev.atribuicao_id = ? OR ev.atribuicao_id IN (
-                SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ?
-            ))
-            AND ev.data_associacao < ?
-            GROUP BY ev.data_associacao
-            ORDER BY ev.data_associacao DESC
-            LIMIT 1
-        ''', (atribuicao_id, conjunto_id, data_atual_str))
+            SELECT vm.id FROM viatura_motorista vm
+            INNER JOIN conjuntos_habituais c ON c.id = ?
+            INNER JOIN motoristas m ON m.id = c.motorista_id
+            WHERE UPPER(TRIM(vm.nome_motorista)) = UPPER(TRIM(m.nome)) AND vm.ativo = 1
+        ''', (conjunto_id,))
+        vm_ids = [r[0] for r in cursor.fetchall()]
+        placeholders_vm = ', '.join('?' * len(vm_ids)) if vm_ids else ''
         
-        ultima_data = cursor.fetchone()
+        if usar_ultimo_dia_com_servico:
+            params_max = [conjunto_id, data_ref_iso]
+            if vm_ids:
+                params_max.extend(vm_ids)
+            params_max.append(data_ref_iso)
+            sql_max = '''
+                SELECT MAX(date(ev.data_associacao)) as data_ultima
+                FROM encomenda_viatura ev
+                WHERE (
+                    ev.atribuicao_id IN (
+                        SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ? AND date(data_atribuicao) < date(?)
+                    )''' + ((' OR ev.viatura_motorista_id IN (' + placeholders_vm + ')') if placeholders_vm else '') + '''
+                )
+                AND date(ev.data_associacao) < ?
+            '''
+            cursor.execute(sql_max, params_max)
+            row = cursor.fetchone()
+            data_uso = row[0] if row and row[0] else None
+            if not data_uso:
+                conn.close()
+                return jsonify({'data': None, 'encomendas': []})
+            data_uso_str = data_uso if isinstance(data_uso, str) else (data_uso.isoformat() if hasattr(data_uso, 'isoformat') else str(data_uso))
+        else:
+            data_anterior = data_ref - timedelta(days=1)
+            data_uso_str = data_anterior.isoformat()
         
-        if not ultima_data:
-            conn.close()
-            return jsonify({
-                'data': None,
-                'encomendas': []
-            })
-        
-        data_ultima = ultima_data[0]
-        
-        # Buscar todas as encomendas dessa data para este conjunto
-        cursor.execute('''
+        params_enc = [conjunto_id, data_uso_str]
+        if vm_ids:
+            params_enc.extend(vm_ids)
+        params_enc.append(data_uso_str)
+        sql_enc = '''
             SELECT 
                 ev.pedido_id,
                 ev.pedido_tipo,
                 ev.ordem,
                 COALESCE(pp.cliente, pe.cliente) as cliente,
                 COALESCE(pp.local_carga, pe.local_carga) as local_carga,
-                COALESCE(pp.material, pe.material) as material
+                COALESCE(pp.material, pe.material) as material,
+                COALESCE(pp.local_descarga, pe.local_descarga, pp.local_carga, pe.local_carga, '') as local_descarga
             FROM encomenda_viatura ev
             LEFT JOIN pedidos_pendentes pp ON ev.pedido_tipo = 'P' AND ev.pedido_id = pp.id
             LEFT JOIN pedidos_entregues pe ON ev.pedido_tipo = 'E' AND ev.pedido_id = pe.id
-            WHERE (ev.atribuicao_id = ? OR ev.atribuicao_id IN (
-                SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ?
-            ))
-            AND ev.data_associacao = ?
+            WHERE (
+                ev.atribuicao_id IN (
+                    SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ? AND date(data_atribuicao) = date(?)
+                )''' + ((' OR ev.viatura_motorista_id IN (' + placeholders_vm + ')') if placeholders_vm else '') + '''
+            )
+            AND date(ev.data_associacao) = date(?)
             ORDER BY ev.ordem ASC
-        ''', (atribuicao_id, conjunto_id, data_ultima))
+        '''
+        cursor.execute(sql_enc, params_enc)
         
         encomendas = cursor.fetchall()
         conn.close()
         
-        # Converter para lista de dicionários
         resultado = []
         for e in encomendas:
+            ld = (e[6] or '').strip() if len(e) > 6 else ''
+            lc = (e[4] or '').strip() if len(e) > 4 else ''
             resultado.append({
                 'cliente': e[3] or '',
-                'local_carga': e[4] or '',
-                'material': e[5] or ''
+                'local_carga': lc,
+                'material': e[5] or '',
+                'local_descarga': ld or lc
             })
         
         return jsonify({
-            'data': data_ultima,
+            'data': data_uso_str,
             'encomendas': resultado
         })
     except Exception as e:
@@ -5932,6 +7018,200 @@ def get_ultimo_servico_atribuicao(atribuicao_id):
             except:
                 pass
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/atribuicao/<atribuicao_id>/avaria', methods=['GET', 'PUT', 'PATCH'])
+def atualizar_avaria_atribuicao(atribuicao_id):
+    """GET: estado atual. PUT/PATCH: marcar ou desmarcar avaria. Não apaga encomendas."""
+    try:
+        try:
+            atribuicao_id = int(atribuicao_id)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'ID de atribuição inválido'}), 400
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(atribuicoes_motoristas)")
+        cols = [row[1] for row in cursor.fetchall()]
+        if 'avaria_alteracao' not in cols:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Funcionalidade não disponível nesta base de dados.'}), 400
+        if request.method == 'GET':
+            sel_nota = ', avaria_nota' if 'avaria_nota' in cols else ''
+            cursor.execute(
+                f'SELECT avaria_alteracao, avaria_observacao{sel_nota} FROM atribuicoes_motoristas WHERE id = ?',
+                (atribuicao_id,)
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if not row:
+                return jsonify({'success': False, 'error': 'Atribuição não encontrada'}), 404
+            out = {'success': True, 'avaria_alteracao': bool(row[0]), 'avaria_observacao': (row[1] or '') if len(row) > 1 else ''}
+            if 'avaria_nota' in cols and len(row) > 2:
+                out['avaria_nota'] = (row[2] or '').strip()
+            return jsonify(out)
+        data = request.get_json() or {}
+        avaria = data.get('avaria', data.get('avaria_alteracao', None))
+        observacao = (data.get('avaria_observacao') or data.get('observacao') or '').strip()
+        nota = (data.get('avaria_nota') or '').strip() if data.get('avaria_nota') is not None else None
+        if avaria is True or avaria == 1 or avaria == '1':
+            # Só recalcular avaria_apos_ordem quando estamos a MARCAR a avaria pela primeira vez.
+            # Se já estava marcada (só a atualizar observação ou nota), manter a posição atual.
+            avaria_apos_ordem = None
+            if 'avaria_apos_ordem' in cols:
+                cursor.execute('SELECT avaria_alteracao, avaria_apos_ordem FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+                r_curr = cursor.fetchone()
+                ja_tem_avaria = r_curr and (r_curr[0] == 1 or r_curr[0] is True)
+                if ja_tem_avaria and r_curr[1] is not None:
+                    avaria_apos_ordem = r_curr[1]  # Manter posição (observação/nota não movem a avaria)
+            if avaria_apos_ordem is None:
+                # Primeira vez a marcar: avaria fica depois da última encomenda; se depois acrescentar mais, fica no meio
+                cursor.execute('SELECT data_atribuicao, conjunto_id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+                row_atr = cursor.fetchone()
+                if row_atr:
+                    data_atrib = row_atr[0]
+                    conjunto_id = row_atr[1]
+                    cursor.execute('''
+                        SELECT COUNT(*) FROM encomenda_viatura ev
+                        WHERE (ev.atribuicao_id = ? OR ev.atribuicao_id IN (SELECT id FROM atribuicoes_motoristas WHERE conjunto_id = ? AND date(data_atribuicao) = date(?)))
+                        AND date(ev.data_associacao) = date(?)
+                    ''', (atribuicao_id, conjunto_id, data_atrib, data_atrib))
+                    r = cursor.fetchone()
+                    avaria_apos_ordem = (r[0] or 0) if r else 0
+            if 'avaria_apos_ordem' in cols and 'avaria_nota' in cols:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 1, avaria_observacao = ?, avaria_apos_ordem = ?, avaria_nota = ?
+                    WHERE id = ?
+                ''', (observacao or None, avaria_apos_ordem, nota if nota else None, atribuicao_id))
+            elif 'avaria_apos_ordem' in cols:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 1, avaria_observacao = ?, avaria_apos_ordem = ?
+                    WHERE id = ?
+                ''', (observacao or None, avaria_apos_ordem, atribuicao_id))
+            elif 'avaria_nota' in cols:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 1, avaria_observacao = ?, avaria_nota = ?
+                    WHERE id = ?
+                ''', (observacao or None, nota if nota else None, atribuicao_id))
+            else:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 1, avaria_observacao = ?
+                    WHERE id = ?
+                ''', (observacao or None, atribuicao_id))
+        else:
+            if 'avaria_apos_ordem' in cols and 'avaria_nota' in cols:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 0, avaria_observacao = NULL, avaria_apos_ordem = NULL, avaria_nota = NULL
+                    WHERE id = ?
+                ''', (atribuicao_id,))
+            elif 'avaria_apos_ordem' in cols:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 0, avaria_observacao = NULL, avaria_apos_ordem = NULL
+                    WHERE id = ?
+                ''', (atribuicao_id,))
+            else:
+                cursor.execute('''
+                    UPDATE atribuicoes_motoristas
+                    SET avaria_alteracao = 0, avaria_observacao = NULL
+                    WHERE id = ?
+                ''', (atribuicao_id,))
+        conn.commit()
+        conn.close()
+        return jsonify({'success': True})
+    except Exception as e:
+        if 'conn' in locals():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/atribuicoes-motoristas/<atribuicao_id>/avaria', methods=['GET', 'PUT', 'PATCH'])
+def atualizar_avaria_atribuicao_alias(atribuicao_id):
+    """Alias: mesmo endpoint com path alternativo."""
+    return atualizar_avaria_atribuicao(atribuicao_id)
+
+
+def _motorista_inicio_cedo_impl(atribuicao_id, data=None):
+    """Lógica comum: definir ou limpar hora de saída (05:00 ou 06:00)."""
+    if data is None:
+        data = request.get_json() or {}
+    hora = (data.get('hora_inicio_cedo') or data.get('hora_inicio') or '').strip()
+    if hora in ('05:00', '5', '5h', '5:00'):
+        hora = '05:00'
+    elif hora in ('06:00', '6', '6h', '6:00'):
+        hora = '06:00'
+    else:
+        hora = None
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'Atribuição não encontrada'}), 404
+    if hora:
+        cursor.execute(
+            'INSERT OR REPLACE INTO motorista_inicio_cedo (atribuicao_id, hora_inicio) VALUES (?, ?)',
+            (atribuicao_id, hora)
+        )
+    else:
+        cursor.execute('DELETE FROM motorista_inicio_cedo WHERE atribuicao_id = ?', (atribuicao_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'hora_inicio_cedo': hora})
+
+
+@app.route('/api/motorista-hora-saida', methods=['POST'])
+def motorista_hora_saida_post():
+    """POST com body { atribuicao_id, hora_inicio_cedo }. Redireciona para a mesma lógica."""
+    try:
+        data = request.get_json() or {}
+        aid = data.get('atribuicao_id')
+        if aid is None:
+            return jsonify({'success': False, 'error': 'atribuicao_id em falta'}), 400
+        try:
+            atribuicao_id = int(aid)
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'atribuicao_id inválido'}), 400
+        return _motorista_inicio_cedo_impl(atribuicao_id, data)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/atribuicao/<int:atribuicao_id>/inicio-cedo', methods=['GET', 'PUT', 'PATCH', 'POST'])
+def motorista_inicio_cedo(atribuicao_id):
+    """Definir que o motorista nesse dia deve começar mais cedo (5h ou 6h). GET: estado. PUT/PATCH/POST: definir ou limpar."""
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM atribuicoes_motoristas WHERE id = ?', (atribuicao_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return jsonify({'success': False, 'error': 'Atribuição não encontrada'}), 404
+        if request.method == 'GET':
+            cursor.execute('SELECT hora_inicio FROM motorista_inicio_cedo WHERE atribuicao_id = ?', (atribuicao_id,))
+            row = cursor.fetchone()
+            conn.close()
+            hora = (row[0] or '').strip() or None if row else None
+            return jsonify({'success': True, 'hora_inicio_cedo': hora})
+        return _motorista_inicio_cedo_impl(atribuicao_id)
+    except Exception as e:
+        if 'conn' in locals():
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+try:
+    print('✓ Rotas /api/atribuicao/.../avaria e /api/atribuicoes-motoristas/.../avaria registadas.')
+except Exception:
+    pass
 
 # Verificar dependências na inicialização
 def verificar_dependencias():
@@ -6188,6 +7468,10 @@ def get_cards_planeamento():
             else:
                 fora_continuacao_dict[mid] = num
         
+        # Encomendas (ev.id) marcadas como "carregado no dia anterior"
+        cursor.execute('SELECT encomenda_viatura_id FROM encomenda_carregado_dia_anterior')
+        encomenda_carregado_dia_anterior_ids = set(r[0] for r in cursor.fetchall())
+        
         # Buscar todas as atribuições do dia (criar automaticamente se não existirem)
         cursor.execute(f'''
             SELECT 
@@ -6202,7 +7486,11 @@ def get_cards_planeamento():
                 cis.matricula as cisterna_matricula,
                 cis.codigo as cisterna_codigo,
                 m.nome as motorista_nome,
-                m_h.nome as motorista_habitual_nome
+                m_h.nome as motorista_habitual_nome,
+                COALESCE(a.avaria_alteracao, 0) as avaria_alteracao,
+                a.avaria_observacao as avaria_observacao,
+                a.avaria_apos_ordem as avaria_apos_ordem,
+                a.avaria_nota as avaria_nota
             FROM conjuntos_habituais c
             LEFT JOIN atribuicoes_motoristas a ON a.conjunto_id = c.id AND a.data_atribuicao = ?
             LEFT JOIN tratores t ON c.trator_id = t.id
@@ -6325,8 +7613,43 @@ def get_cards_planeamento():
                     'numero_noites_fora': passa_noite_dict.get((atrib.get('motorista_id') or motorista_habitual_id), 0),
                     'fora_continuacao': (atrib.get('motorista_id') or motorista_habitual_id) in fora_continuacao_dict,
                     'fora_continuacao_nivel': fora_continuacao_dict.get((atrib.get('motorista_id') or motorista_habitual_id), 0),
+                    'avaria_alteracao': bool(atrib.get('avaria_alteracao') or 0),
+                    'avaria_observacao': (atrib.get('avaria_observacao') or '').strip(),
+                    'avaria_apos_ordem': atrib.get('avaria_apos_ordem') if atrib.get('avaria_apos_ordem') is not None else None,
+                    'avaria_nota': (atrib.get('avaria_nota') or '').strip(),
+                    'hora_inicio_cedo': None,
                     'encomendas': []
                 }
+                cursor.execute('SELECT hora_inicio FROM motorista_inicio_cedo WHERE atribuicao_id = ?', (atribuicao_id,))
+                mic_row = cursor.fetchone()
+                if mic_row and mic_row[0]:
+                    card['hora_inicio_cedo'] = (mic_row[0] or '').strip() or None
+                
+                # Aplicar matrícula temporária do dia (alterar matrícula apenas neste dia)
+                # Preferir lookup por atribuicao_id + data; fallback por vm_id para registos antigos
+                cursor.execute('''
+                    SELECT matricula_trator, matricula_galera FROM matricula_temporaria_detalhada
+                    WHERE data_associacao = ? AND atribuicao_id = ?
+                ''', (data_str, atribuicao_id))
+                mt_row = cursor.fetchone()
+                if not mt_row:
+                    vm_id_card, _, _ = _resolver_viatura_motorista_id(cursor, atribuicao_id)
+                    if vm_id_card:
+                        cursor.execute('''
+                            SELECT matricula_trator, matricula_galera FROM matricula_temporaria_detalhada
+                            WHERE data_associacao = ? AND viatura_motorista_id = ?
+                        ''', (data_str, vm_id_card))
+                        mt_row = cursor.fetchone()
+                if mt_row and (mt_row[0] or mt_row[1]):
+                    partes = []
+                    if mt_row[0]:
+                        partes.append(mt_row[0].strip())
+                    if mt_row[1]:
+                        partes.append(mt_row[1].strip())
+                    card['matricula'] = ' + '.join(partes) if partes else card['matricula']
+                    # Para o frontend mostrar a matrícula do dia (prioridade sobre trator_matricula + cisterna_matricula)
+                    card['matricula_trator_temp'] = (mt_row[0] or '').strip() or None
+                    card['matricula_galera_temp'] = (mt_row[1] or '').strip() or None
                 
                 # Buscar encomendas associadas a esta atribuição
                 try:
@@ -6381,6 +7704,8 @@ def get_cards_planeamento():
                 encomendas = []
                 for e in raw_rows:
                     row = dict(e)
+                    ev_id = row.get('id')
+                    row['carregado_dia_anterior'] = ev_id in encomenda_carregado_dia_anterior_ids if ev_id is not None else False
                     pid = row.get('pedido_id')
                     if row.get('pedido_tipo') == 'P' and pid:
                         if pid in descarga_por_id:
@@ -8511,6 +9836,10 @@ if __name__ != '__main__' and os.environ.get('PORT'):
         print(f'[AVISO] init_db em produção: {e}')
 
 if __name__ == '__main__':
+    # Porta 8080 (muitas redes corporativas permitem 8080 e bloqueiam 5000)
+    SERVER_PORT = 8080
+    app.config['SERVER_PORT'] = SERVER_PORT
+    
     # Inicializar banco de dados
     init_db()
     
@@ -8518,6 +9847,19 @@ if __name__ == '__main__':
     import subprocess
     hostname = socket.gethostname()
     ip_local = socket.gethostbyname(hostname)
+    # Preferir IP da LAN (192.168.x.x ou 10.x.x.x) para outros PCs na rede acederem
+    _lan_ip = None
+    try:
+        for res in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = (res[4][0] if res[4] else '').strip()
+            if ip and not ip.startswith('127.') and (ip.startswith('192.168.') or ip.startswith('10.')):
+                _lan_ip = ip
+                break
+        if _lan_ip:
+            ip_local = _lan_ip
+    except Exception:
+        pass
+    app.config['IP_LOCAL'] = ip_local
     tailscale_ip = None
     try:
         for cmd in [['tailscale', 'ip', '-4'], ['tailscale', 'ip', '--4'], ['tailscale.exe', 'ip', '-4']]:
@@ -8535,6 +9877,32 @@ if __name__ == '__main__':
     if tailscale_ip:
         app.config['TAILSCALE_IP'] = tailscale_ip
     
+    # Abrir porta 8080 na Firewall do Windows automaticamente (para outros PCs na rede acederem)
+    if os.name == 'nt':
+        _rule_name = "Planeamento Cargas - Porta 8080"
+        _no_window = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        try:
+            _check = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                 f"Get-NetFirewallRule -DisplayName '{_rule_name}' -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=5, creationflags=_no_window
+            )
+            _exists = _check.returncode == 0 and _rule_name in (_check.stdout or '')
+            if not _exists:
+                _r = subprocess.run(
+                    ['powershell', '-NoProfile', '-NonInteractive', '-Command',
+                     f"New-NetFirewallRule -DisplayName '{_rule_name}' -Direction Inbound -LocalPort {SERVER_PORT} -Protocol TCP -Action Allow -Profile Any -ErrorAction Stop"],
+                    capture_output=True, text=True, timeout=10, creationflags=_no_window
+                )
+                if _r.returncode == 0:
+                    print(f"Firewall: porta {SERVER_PORT} aberta para acesso na rede.")
+                else:
+                    raise RuntimeError(_r.stderr or _r.stdout or 'Falhou')
+            else:
+                print(f"Firewall: regra da porta {SERVER_PORT} ja existe.")
+        except Exception:
+            print(f"Firewall: nao foi possivel abrir a porta {SERVER_PORT} (execute o servidor como administrador ou ABRIR_PORTA_8080_FIREWALL.bat uma vez).")
+    
     print("SERVIDOR DE PLANEAMENTO DE CARGAS")
     print("=" * 60)
     
@@ -8543,25 +9911,14 @@ if __name__ == '__main__':
     verificar_dependencias()
     print("=" * 60)
     
-    # Configurar acesso pela internet via Cloudflare Tunnel
-    # DESATIVADO: Use ServeZero ou outro túnel externamente
-    # Para usar Cloudflare, execute cloudflared manualmente em outra janela
+    # Aplicação apenas na rede local ou via VPN (sem túneis para a internet).
     url_publica = None
     app.config['URL_PUBLICA'] = None
+    print("Acesso: rede local ou VPN (sem precisar de direitos de administrador).")
+    print("  -> Use a rede local (Wi-Fi/LAN) ou a VPN já configurada pela empresa.")
+    print("=" * 60)
 
-    _dir = os.path.dirname(os.path.abspath(__file__))
-    # Por defeito: túnel Cloudflare (sem token, funciona em redes corporativas). Ngrok só se existir usar_ngrok.txt
-    usar_ngrok_automatico = os.path.exists(os.path.join(_dir, 'usar_ngrok.txt'))
-    if not usar_ngrok_automatico:
-        print("🌐 Acesso fora da rede: túnel Cloudflare (aguarde ~15 s para a URL). Para usar ngrok, crie usar_ngrok.txt.")
-    if os.path.exists(os.path.join(_dir, 'ngrok_desativado.txt')):
-        usar_ngrok_automatico = False
-    if os.environ.get('NO_NGROK', '').strip().lower() in ('1', 'true', 'yes'):
-        usar_ngrok_automatico = False
-
-    usar_cloudflare_automatico = False  # quick tunnel é iniciado em thread quando url_publica é None
-
-    if usar_ngrok_automatico:
+    if False:  # (ngrok removido: uso apenas em rede corporativa ou VPN)
         try:
             import subprocess
             import time
@@ -8619,9 +9976,11 @@ if __name__ == '__main__':
                     if os.path.exists(ngrok_token_file):
                         try:
                             with open(ngrok_token_file, 'r', encoding='utf-8') as f:
-                                ngrok_token = f.read().strip()
+                                # Uma linha apenas (evitar token inválido se houver linhas a mais)
+                                ngrok_token = (f.readline() or '').strip()
                                 if ngrok_token:
                                     pyngrok_module.set_auth_token(ngrok_token)
+                                    os.environ['NGROK_AUTHTOKEN'] = ngrok_token  # processo ngrok também lê da env
                                     print(f"✅ Token ngrok configurado ({len(ngrok_token)} caracteres)")
                         except Exception as e:
                             print(f"⚠️  Erro ao ler token: {e}")
@@ -8634,38 +9993,37 @@ if __name__ == '__main__':
                         print(f"    3. Coloque dentro uma única linha com o token (sem aspas nem espaços extras)")
                         raise RuntimeError("Token ngrok em falta")
                     
-                    # Config ngrok: v3. Forçar bypass ao proxy corporativo (evita x509 / korgn.su.lennut.com)
-                    ngrok_config_path = os.path.join(os.path.dirname(__file__), 'ngrok_config.yml')
-                    config_abs = os.path.abspath(ngrok_config_path)
+                    # Não usar config_path com pyngrok: o token tem de vir de set_auth_token + NGROK_AUTHTOKEN
                     _dir = os.path.dirname(os.path.abspath(__file__))
                     ca_pem = os.path.join(_dir, 'ngrok_corporate_ca.pem')
-                    connect_cas_value = 'host'
                     if os.path.isfile(ca_pem):
-                        ca_path_yaml = os.path.abspath(ca_pem).replace('\\', '/')
-                        connect_cas_value = f'"{ca_path_yaml}"'
-                        print(f"✅ A usar certificado CA corporativo: {ca_pem}")
-                    try:
-                        with open(ngrok_config_path, 'w', encoding='utf-8') as f:
-                            f.write('version: "3"\n')
-                            f.write('agent:\n')
-                            f.write(f'  authtoken: "{ngrok_token}"\n')
-                            f.write(f'  connect_cas: {connect_cas_value}\n')
-                            f.write('  region: eu\n')
-                            # Forçar sem proxy (proxy corporativo quebra TLS para tunnel.us.ngrok.com)
-                            f.write('  proxy_url: ""\n')
-                    except Exception as e:
-                        print(f"⚠️  Erro ao escrever config ngrok: {e}")
-                    # Forçar bypass total ao proxy: ngrok deve ligar direto a tunnel.us.ngrok.com
+                        print(f"ℹ️  Certificado CA corporativo presente; em rede com proxy use dados móveis (hotspot) para o ngrok funcionar.")
+                    # Forçar bypass ao proxy para o processo ngrok
                     _proxy_vars = ('NO_PROXY', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy')
                     _proxy_antes = {k: os.environ.get(k) for k in _proxy_vars}
                     for k in _proxy_vars:
                         os.environ.pop(k, None)
                     os.environ['NO_PROXY'] = '*'
                     os.environ['no_proxy'] = '*'
+                    if ngrok_token:
+                        os.environ['NGROK_AUTHTOKEN'] = ngrok_token
+                    # Config v3 na pasta do projeto (evita ler .ngrok2/ngrok.yml antigo sem "version")
+                    _ngrok_yml = os.path.join(_dir, 'ngrok_config_app.yml')
+                    try:
+                        with open(_ngrok_yml, 'w', encoding='utf-8') as f:
+                            f.write('version: "3"\n')
+                            f.write('agent:\n')
+                            f.write(f'  authtoken: "{ngrok_token}"\n')
+                        os.environ['NGROK_CONFIG'] = _ngrok_yml
+                    except Exception as e:
+                        print(f"⚠️  Erro ao escrever config ngrok: {e}")
                     try:
                         from pyngrok import conf as pyngrok_conf
-                        pyngrok_config = pyngrok_conf.PyngrokConfig(config_path=config_abs)
-                        public_url = pyngrok_module.connect(5000, pyngrok_config=pyngrok_config)
+                        _ngrok_exe = os.path.join(_dir, 'ngrok.exe' if os.name == 'nt' else 'ngrok')
+                        cfg = pyngrok_conf.PyngrokConfig(ngrok_version='v3', ngrok_path=_ngrok_exe, config_path=_ngrok_yml)
+                        print("📥 A instalar/atualizar ngrok v3 na pasta do projeto...")
+                        pyngrok_module.install_ngrok(cfg)
+                        public_url = pyngrok_module.connect(5000, pyngrok_config=cfg)
                     except (AttributeError, TypeError):
                         public_url = pyngrok_module.connect(5000)
                     finally:
@@ -8686,7 +10044,9 @@ if __name__ == '__main__':
                     err_str = str(e).lower()
                     print(f"⚠️  Erro ao criar túnel com pyngrok: {e}")
                     print("   Por agora, o servidor está disponível apenas na rede local.")
-                    if 'x509' in err_str or 'certificate' in err_str or 'korgn' in err_str or 'unknown authority' in err_str:
+                    if '4018' in err_str or 'verified account' in err_str or 'authtoken' in err_str:
+                        print("   Conta/token ngrok: confirme o email em https://dashboard.ngrok.com e copie um novo authtoken para ngrok_token.txt")
+                    elif 'x509' in err_str or 'certificate' in err_str or 'korgn' in err_str or 'unknown authority' in err_str:
                         print("   Rede corporativa com proxy/DPI (ex.: korgn.su.lennut.com) intercepta HTTPS.")
                         print("   Opções:")
                         print("   1. Usar telemóvel em DADOS MÓVEIS como hotspot e ligar o PC a esse Wi-Fi (ngrok passa a funcionar).")
@@ -8706,73 +10066,122 @@ if __name__ == '__main__':
                 ngrok_config_path = os.path.join(os.path.dirname(__file__), 'ngrok_config.yml')
                 ngrok_token = None
                 
+                config_abs = None
                 if os.path.exists(ngrok_token_file):
                     try:
                         with open(ngrok_token_file, 'r', encoding='utf-8') as f:
-                            ngrok_token = f.read().strip()
+                            ngrok_token = (f.readline() or '').strip()
                             if ngrok_token:
                                 print(f"✅ Token ngrok carregado do ficheiro ({len(ngrok_token)} caracteres)")
-                                # Escrever config com root_cas: trusted (evita erros de certificado)
+                                # Config v3 (ngrok na pasta do projeto é v3)
                                 with open(ngrok_config_path, 'w', encoding='utf-8') as cf:
-                                    cf.write('version: "2"\n')
-                                    cf.write(f'authtoken: "{ngrok_token}"\n')
-                                    cf.write('root_cas: trusted\n')
-                                    cf.write('region: us\n')
+                                    cf.write('version: "3"\n')
+                                    cf.write('agent:\n')
+                                    cf.write(f'  authtoken: "{ngrok_token}"\n')
                                 config_abs = os.path.abspath(ngrok_config_path)
+                                os.environ['NGROK_CONFIG'] = config_abs
                     except Exception as e:
                         print(f"⚠️  Erro ao ler token: {e}")
                         config_abs = None
-                else:
-                    config_abs = None
                 
-                # Iniciar ngrok em background (usar config com root_cas: trusted se existir)
-                print("🚀 Criando túnel ngrok (URL aleatória)...")
-                cmd = [ngrok_path, 'http', '5000']
-                if config_abs and os.path.exists(ngrok_config_path):
-                    cmd.extend(['--config', config_abs])
-                ngrok_process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                
-                # Registrar função para encerrar ngrok ao sair
-                def encerrar_ngrok():
-                    try:
-                        if ngrok_process and ngrok_process.poll() is None:
-                            ngrok_process.terminate()
-                            ngrok_process.wait(timeout=5)
-                    except:
-                        pass
-                
-                atexit.register(encerrar_ngrok)
-                
-                # Aguardar ngrok iniciar e obter URL
-                time.sleep(3)
-                
-                # Tentar obter URL da API do ngrok
+                # Preferir pyngrok com este binário (obtém URL diretamente, sem depender de localhost:4040)
+                url_publica = None
                 try:
-                    import urllib.request
-                    response = urllib.request.urlopen('http://localhost:4040/api/tunnels', timeout=5)
-                    data = json.loads(response.read().decode())
-                    
-                    if data.get('tunnels') and len(data['tunnels']) > 0:
-                        url_publica = data['tunnels'][0]['public_url']
-                        app.config['URL_PUBLICA'] = url_publica
-                        print(f"✅ Túnel ngrok criado com sucesso!")
-                        print(f"🌍 URL Pública (Internet): {url_publica}")
-                        print(f"   ⚠️  Esta URL muda a cada reinício do servidor!")
-                        print(f"   ⚠️  Esta URL permite acesso de qualquer lugar na internet!")
-                        print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
-                        print(f"   💡 Para ver a URL novamente: http://localhost:4040")
+                    from pyngrok import ngrok as pyngrok_exe
+                    from pyngrok import conf as pyngrok_conf_exe
+                    if ngrok_token:
+                        pyngrok_exe.set_auth_token(ngrok_token)
+                        os.environ['NGROK_AUTHTOKEN'] = ngrok_token
+                    _dir = os.path.dirname(os.path.abspath(__file__))
+                    _ngrok_abs = os.path.abspath(ngrok_path) if not os.path.isabs(ngrok_path) else ngrok_path
+                    _cfg_path = config_abs or os.path.join(_dir, 'ngrok_config_app.yml')
+                    if ngrok_token and not config_abs:
+                        try:
+                            with open(_cfg_path, 'w', encoding='utf-8') as cf:
+                                cf.write('version: "3"\n')
+                                cf.write('agent:\n')
+                                cf.write(f'  authtoken: "{ngrok_token}"\n')
+                        except Exception:
+                            pass
+                    cfg_exe = pyngrok_conf_exe.PyngrokConfig(ngrok_version='v3', ngrok_path=_ngrok_abs, config_path=_cfg_path)
+                    print("🚀 Criando túnel ngrok (via pyngrok com o seu binário)...")
+                    for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+                        os.environ.pop(k, None)
+                    os.environ['NO_PROXY'] = '*'
+                    public_url = pyngrok_exe.connect(5000, pyngrok_config=cfg_exe)
+                    url_publica = str(public_url) if public_url else None
+                except Exception as e_py:
+                    # Fallback: subprocess + API 4040
+                    if ngrok_token and config_abs:
+                        print("🚀 Criando túnel ngrok (subprocess)...")
+                        cmd = [ngrok_path, 'http', '5000', '--config', config_abs]
+                        ngrok_process = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            env=os.environ.copy(),
+                            cwd=os.path.dirname(os.path.abspath(__file__))
+                        )
+                        def encerrar_ngrok():
+                            try:
+                                if ngrok_process and ngrok_process.poll() is None:
+                                    ngrok_process.terminate()
+                                    ngrok_process.wait(timeout=5)
+                            except:
+                                pass
+                        atexit.register(encerrar_ngrok)
+                        time.sleep(3)
+                        if ngrok_process.poll() is not None:
+                            _err = (ngrok_process.stderr and ngrok_process.stderr.read()) or ''
+                            _out = (ngrok_process.stdout and ngrok_process.stdout.read()) or ''
+                            print("⚠️  O ngrok terminou de imediato (não está a escutar em 4040).")
+                            if _err:
+                                for linha in (_err.strip() or '').split('\n')[:15]:
+                                    if linha.strip():
+                                        print("   ", linha.strip())
+                            if _out and not _err:
+                                for linha in (_out.strip() or '').split('\n')[:15]:
+                                    if linha.strip():
+                                        print("   ", linha.strip())
+                            print("   Sugestão: renomeie ou apague ngrok.exe e reinicie (o app usará pyngrok sozinho).")
+                        else:
+                            for _ in range(8):
+                                time.sleep(2)
+                                try:
+                                    import urllib.request
+                                    req = urllib.request.Request('http://127.0.0.1:4040/api/tunnels', headers={'Accept': 'application/json'})
+                                    with urllib.request.urlopen(req, timeout=4) as response:
+                                        data = json.loads(response.read().decode())
+                                        if data.get('tunnels') and len(data['tunnels']) > 0:
+                                            url_publica = data['tunnels'][0].get('public_url')
+                                            break
+                                except Exception:
+                                    pass
+                                if url_publica:
+                                    break
+                                try:
+                                    req = urllib.request.Request('http://127.0.0.1:4040/api/endpoints', headers={'Accept': 'application/json'})
+                                    with urllib.request.urlopen(req, timeout=4) as response:
+                                        data = json.loads(response.read().decode())
+                                        if data.get('endpoints') and len(data['endpoints']) > 0:
+                                            url_publica = data['endpoints'][0].get('url')
+                                            break
+                                except Exception:
+                                    pass
                     else:
-                        print("⚠️  ngrok iniciado, mas URL ainda não disponível.")
-                        print("   Aguarde alguns segundos e verifique: http://localhost:4040")
-                except Exception as e:
+                        print(f"⚠️  pyngrok com ngrok.exe falhou: {e_py}")
+                        print("   Coloque o token em ngrok_token.txt e reinicie.")
+                
+                if url_publica:
+                    app.config['URL_PUBLICA'] = url_publica
+                    print(f"✅ Túnel ngrok criado com sucesso!")
+                    print(f"🌍 URL Pública (Internet): {url_publica}")
+                    print(f"   ⚠️  Esta URL muda a cada reinício do servidor!")
+                    print(f"   🔒 Certifique-se de que o sistema de login está ativo.")
+                else:
                     print("⚠️  ngrok iniciado, mas não foi possível obter URL automaticamente.")
-                    print("   Verifique a URL em: http://localhost:4040")
-                    print("   Ou veja a janela do ngrok se abriu.")
+                    print("   Abra no browser: http://localhost:4040 e copie a URL pública (HTTPS).")
                 
         except Exception as e:
             error_msg = str(e)
@@ -8806,41 +10215,499 @@ if __name__ == '__main__':
             if not flask_ready:
                 return
             _base = os.path.dirname(os.path.abspath(__file__))
-            cloudflared_exe = os.path.join(_base, 'cloudflared.exe')
-            cloudflared_path = None
-            for path in ['cloudflared', 'cloudflared.exe', cloudflared_exe]:
-                try:
-                    r = subprocess.run([path, 'version'], capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        cloudflared_path = path
+            # No Windows: usar sempre o OpenSSH do Windows (System32). Se não existir, instalar automaticamente.
+            _ssh_exe = 'ssh'
+            if os.name == 'nt':
+                _sysroot = os.environ.get('SystemRoot', 'C:\\Windows')
+                _win_ssh = os.path.join(_sysroot, 'System32', 'OpenSSH', 'ssh.exe')
+                _use_win_ssh = False
+                if os.path.isfile(_win_ssh):
+                    try:
+                        r = subprocess.run([_win_ssh, '-V'], capture_output=True, timeout=5)
+                        if r.returncode == 0 or (r.stderr and b'OpenSSH' in r.stderr):
+                            _use_win_ssh = True
+                            _ssh_exe = _win_ssh
+                    except Exception:
+                        pass
+                if not _use_win_ssh:
+                    # OpenSSH do Windows não está instalado: instalar agora (vai pedir UAC)
+                    print("🌐 A instalar Cliente OpenSSH (necessário para o link fora da rede)...")
+                    print("   Vai abrir uma janela a pedir autorização de administrador — clique em Sim.")
+                    _ps1 = os.path.join(_base, 'instalar_openssh.ps1')
+                    try:
+                        _script = r'''$cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like "OpenSSH.Client*" -and $_.State -ne "Installed" } | Select-Object -First 1
+if ($cap) { Add-WindowsCapability -Online -Name $cap.Name }
+'''
+                        with open(_ps1, 'w', encoding='utf-8') as f:
+                            f.write(_script.strip())
+                        _ps1_esc = _ps1.replace("'", "''")
+                        _cmd = "Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','" + _ps1_esc + "' -Verb RunAs -Wait"
+                        subprocess.run(['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', _cmd], timeout=180, cwd=_base)
+                    except Exception as _e:
+                        print(f"   Instalação falhou: {_e}")
+                    if os.path.isfile(_win_ssh):
+                        try:
+                            r = subprocess.run([_win_ssh, '-V'], capture_output=True, timeout=5)
+                            if r.returncode == 0 or (r.stderr and b'OpenSSH' in r.stderr):
+                                _ssh_exe = _win_ssh
+                                print("   OpenSSH instalado. A criar túnel...")
+                        except Exception:
+                            pass
+                    if _ssh_exe == 'ssh':
+                        print("   Se não instalou: Definições > Aplicações > Funcionalidades opcionais > Adicionar > Cliente OpenSSH")
+            # 1) Tentar localhost.run primeiro (SSH; costuma funcionar em redes corporativas)
+            print("🌐 A tentar túnel localhost.run (SSH)...")
+            _lh_url = None
+            try:
+                _ssh_cmd = [_ssh_exe, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL' if os.name == 'nt' else 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=5', '-R', '80:localhost:5000', 'nokey@localhost.run', '--', '--output', 'json']
+                _p = subprocess.Popen(_ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                _ssh_queue = queue.Queue()
+                _ssh_lines = []
+                def _ssh_reader():
+                    try:
+                        for _line in iter(_p.stdout.readline, ''):
+                            if _line:
+                                _line = _line.strip()
+                                _ssh_lines.append(_line)
+                                _ssh_queue.put(_line)
+                    except Exception:
+                        pass
+                threading.Thread(target=_ssh_reader, daemon=True).start()
+                for _ in range(40):
+                    time.sleep(1)
+                    if _p.poll() is not None:
                         break
-                except Exception:
-                    pass
-            if not cloudflared_path and os.name == 'nt':
-                try:
-                    ctx = ssl.create_default_context()
-                    req = urllib.request.Request('https://api.github.com/repos/cloudflare/cloudflared/releases/latest', headers={'Accept': 'application/vnd.github.v3+json'})
-                    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                        data = json.loads(resp.read().decode())
-                    for asset in data.get('assets', []):
-                        name = (asset.get('name') or '').lower()
-                        if 'windows' in name and 'amd64' in name and (name.endswith('.exe') or 'exe' in name):
-                            with urllib.request.urlopen(asset.get('browser_download_url'), timeout=60, context=ctx) as resp2:
-                                with open(cloudflared_exe, 'wb') as f:
-                                    f.write(resp2.read())
-                            cloudflared_path = cloudflared_exe
+                    try:
+                        while True:
+                            _line = _ssh_queue.get_nowait()
+                            if not _line:
+                                continue
+                            if '"domain"' in _line or 'Connect to' in _line or (_line.strip().startswith('{') and 'localhost.run' in _line):
+                                try:
+                                    _j = json.loads(_line)
+                                    _dom = (_j.get('domain') or _j.get('url') or '').strip()
+                                    if _dom and '.localhost.run' in _dom and 'admin' not in _dom.lower():
+                                        _dom = _dom.replace('https://', '').replace('http://', '').split()[0]
+                                        _lh_url = 'https://' + _dom
+                                        break
+                                except Exception:
+                                    pass
+                            if 'Connect to ' in _line:
+                                _m2 = re.search(r'Connect to (https?://[^\s"\']+\.localhost\.run)', _line)
+                                if _m2 and 'admin' not in _m2.group(1).lower():
+                                    _lh_url = _m2.group(1).strip().rstrip(').,;')
+                                    if not _lh_url.startswith('http'):
+                                        _lh_url = 'https://' + _lh_url
+                                    break
+                            _m = re.search(r'https?://([a-zA-Z0-9][a-zA-Z0-9._-]*)\.localhost\.run', _line)
+                            if _m and 'admin' not in _m.group(1).lower():
+                                _lh_url = _m.group(0).strip().rstrip(').,;')
+                                if not _lh_url.startswith('http'):
+                                    _lh_url = 'https://' + _lh_url
+                                break
+                    except queue.Empty:
+                        pass
+                    except Exception:
+                        pass
+                    if _lh_url:
+                        break
+                # Se vimos "Welcome" ou banner do localhost.run, o URL do túnel vem a seguir — esperar mais e ler
+                _has_banner = _ssh_lines and ('welcome' in ' '.join(_ssh_lines).lower() or 'localhost.run' in ' '.join(_ssh_lines).lower() or 'follow your' in ' '.join(_ssh_lines).lower())
+                if not _lh_url and _has_banner:
+                    for _ in range(20):
+                        time.sleep(1)
+                        try:
+                            while True:
+                                _line = _ssh_queue.get_nowait()
+                                _ssh_lines.append(_line)
+                                _mm = re.search(r'https?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.localhost\.run', _line or '')
+                                if _mm and 'admin' not in _mm.group(0).lower():
+                                    _lh_url = _mm.group(0).strip().rstrip(').,;')
+                                    if not _lh_url.startswith('http'):
+                                        _lh_url = 'https://' + _lh_url
+                                    break
+                            if _lh_url:
+                                break
+                        except queue.Empty:
+                            pass
+                # Fallback: procurar URL em todas as linhas (pode ter chegado entre separadores)
+                if not _lh_url and _ssh_lines:
+                    _all_text = ' '.join(_ssh_lines)
+                    _mm = re.search(r'https?://[a-zA-Z0-9][a-zA-Z0-9._-]*\.localhost\.run', _all_text)
+                    if _mm and 'admin' not in _mm.group(0).lower():
+                        _lh_url = _mm.group(0).strip().rstrip(').,;')
+                        if not _lh_url.startswith('http'):
+                            _lh_url = 'https://' + _lh_url
+                if _lh_url:
+                    url_publica = _lh_url
+                    app.config['URL_PUBLICA'] = url_publica
+                    ok = False
+                    for _ in range(5):
+                        try:
+                            req = urllib.request.Request(_lh_url + '/tunnel-ok', headers={'User-Agent': 'Mozilla/5.0'})
+                            with urllib.request.urlopen(req, timeout=12, context=ssl.create_default_context()) as r:
+                                ok = (r.status == 200 and r.read().startswith(b'OK'))
+                            if ok:
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(3)
+                    if ok:
+                        print(f"✅ Túnel localhost.run ativo!")
+                        print(f"🌍 Link para fora da rede: {url_publica}")
+                        print(f"   Ver/copiar link: http://127.0.0.1:5000/link")
+                        def _fechar_ssh():
+                            try:
+                                if _p.poll() is None:
+                                    _p.terminate()
+                                    _p.wait(timeout=5)
+                            except Exception:
+                                pass
+                        atexit.register(_fechar_ssh)
+                    else:
+                        _p.terminate()
+                        try:
+                            _p.wait(timeout=2)
+                        except Exception:
+                            pass
+                        _lh_url = None
+                        url_publica = None
+                else:
+                    try:
+                        _p.terminate()
+                        _p.wait(timeout=3)
+                        _err_msg = None
+                        for _l in _ssh_lines:
+                            _l = (_l or "").strip()
+                            if not _l or len(_l) < 3:
+                                continue
+                            if re.match(r'^[=\-_]+$', _l):
+                                continue
+                            if "permanently added" in _l.lower() or "warning:" in _l.lower() or "welcome to" in _l.lower() or "follow your" in _l.lower() or "twitter.com" in _l.lower():
+                                continue
+                            _err_msg = _l[:100]
                             break
+                        if _err_msg:
+                            print("   localhost.run falhou:", _err_msg)
+                        elif _ssh_lines:
+                            print("   localhost.run: conexão OK mas URL não chegou a tempo (rede lenta?). A tentar serveo...")
+                        else:
+                            print("   localhost.run falhou (sem resposta em 40 s; firewall pode bloquear porta 22).")
+                    except Exception:
+                        pass
+            except Exception as _e:
+                pass
+            # 2) Se localhost.run falhou, tentar serveo.net (também SSH; costuma dar menos 404 que trycloudflare)
+            if not _lh_url:
+                print("🌐 A tentar túnel serveo.net (SSH)...")
+                _sv_url = None
+                try:
+                    _ssh_sv = [_ssh_exe, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL' if os.name == 'nt' else '/dev/null', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=5', '-R', '80:localhost:5000', 'serveo.net']
+                    _ps = subprocess.Popen(_ssh_sv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+                    _sv_queue = queue.Queue()
+                    def _sv_reader():
+                        try:
+                            for _ln in iter(_ps.stdout.readline, ''):
+                                if _ln:
+                                    _sv_queue.put(_ln.strip())
+                        except Exception:
+                            pass
+                    threading.Thread(target=_sv_reader, daemon=True).start()
+                    for _ in range(25):
+                        time.sleep(1)
+                        if _ps.poll() is not None:
+                            break
+                        try:
+                            _ln = _sv_queue.get_nowait()
+                            if _ln:
+                                _mm = re.search(r'https?://([a-zA-Z0-9][a-zA-Z0-9.-]*)\.serveo\.net', _ln)
+                                if _mm:
+                                    _sv_url = _mm.group(0).strip().rstrip(').,;')
+                                    if not _sv_url.startswith('http'):
+                                        _sv_url = 'https://' + _sv_url
+                                    break
+                        except queue.Empty:
+                            pass
+                        except Exception:
+                            pass
+                        if _sv_url:
+                            break
+                    if _sv_url:
+                        url_publica = _sv_url
+                        app.config['URL_PUBLICA'] = url_publica
+                        ok = False
+                        for _ in range(5):
+                            try:
+                                req = urllib.request.Request(_sv_url + '/tunnel-ok', headers={'User-Agent': 'Mozilla/5.0'})
+                                with urllib.request.urlopen(req, timeout=12, context=ssl.create_default_context()) as r:
+                                    ok = (r.status == 200 and r.read().startswith(b'OK'))
+                                if ok:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(3)
+                        if ok:
+                            print(f"✅ Túnel serveo.net ativo!")
+                            print(f"🌍 Link para fora da rede: {url_publica}")
+                            print(f"   Ver/copiar link: http://127.0.0.1:5000/link")
+                            def _fechar_serveo():
+                                try:
+                                    if _ps.poll() is None:
+                                        _ps.terminate()
+                                        _ps.wait(timeout=5)
+                                except Exception:
+                                    pass
+                            atexit.register(_fechar_serveo)
+                            _lh_url = _sv_url  # para não entrar no Cloudflare
+                        else:
+                            try:
+                                _ps.terminate()
+                                _ps.wait(timeout=2)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            _err_sv = []
+                            try:
+                                _rem = _ps.stdout.read() if _ps.stdout else ''
+                                if _rem:
+                                    _err_sv = [_l.strip() for _l in _rem.split('\n') if _l.strip()][:3]
+                            except Exception:
+                                pass
+                            _ps.terminate()
+                            _ps.wait(timeout=2)
+                            if _err_sv:
+                                print("   serveo.net falhou:", _err_sv[0][:80])
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-            if not cloudflared_path:
-                return
-            # Diretório de config vazio: quick tunnel falha se existir config em .cloudflared
-            import tempfile
-            _cf_config_dir = tempfile.mkdtemp(prefix='cf_tunnel_')
-            _cf_env = os.environ.copy()
-            _cf_env['CLOUDFLARED_CONFIG_DIR'] = _cf_config_dir
-            print("🌐 A iniciar Cloudflare Tunnel (servidor já está no ar)...")
-            cf_process = subprocess.Popen(
+            # 3) LocalTunnel (npx) — sem .exe, não é bloqueado pelo antivírus
+            if not _lh_url:
+                print("🌐 A tentar túnel LocalTunnel (npx)...")
+                _lt_url = None
+                _npx_exe = None
+                for _n in ['npx', os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'nodejs', 'npx.cmd'), os.path.join(os.environ.get('ProgramFiles(x86)', 'C:\\Program Files (x86)'), 'nodejs', 'npx.cmd')]:
+                    try:
+                        r = subprocess.run([_n, '--version'], capture_output=True, timeout=5)
+                        if r.returncode == 0:
+                            _npx_exe = _n
+                            break
+                    except Exception:
+                        pass
+                try:
+                    if not _npx_exe:
+                        raise FileNotFoundError("npx não encontrado")
+                    _npx_cmd = [_npx_exe, '-y', 'localtunnel', '--port', '5000']
+                    _pn = subprocess.Popen(_npx_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=_base)
+                    _lt_queue = queue.Queue()
+                    def _lt_reader():
+                        try:
+                            for _ln in iter(_pn.stdout.readline, ''):
+                                if _ln:
+                                    _lt_queue.put(_ln.strip())
+                        except Exception:
+                            pass
+                    threading.Thread(target=_lt_reader, daemon=True).start()
+                    for _ in range(25):
+                        time.sleep(1)
+                        if _pn.poll() is not None:
+                            break
+                        try:
+                            while True:
+                                _ln = _lt_queue.get_nowait()
+                                _m = re.search(r'https?://[a-zA-Z0-9][a-zA-Z0-9.-]*(?:\.loca\.lt|\.localtunnel\.me)', _ln or '')
+                                if _m:
+                                    _lt_url = _m.group(0).strip().rstrip(').,;')
+                                    if not _lt_url.startswith('http'):
+                                        _lt_url = 'https://' + _lt_url
+                                    break
+                            if _lt_url:
+                                break
+                        except queue.Empty:
+                            pass
+                        except Exception:
+                            pass
+                    if _lt_url:
+                        url_publica = _lt_url
+                        app.config['URL_PUBLICA'] = url_publica
+                        ok = False
+                        for _ in range(5):
+                            try:
+                                req = urllib.request.Request(_lt_url + '/tunnel-ok', headers={'User-Agent': 'Mozilla/5.0'})
+                                with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as r:
+                                    ok = (r.status == 200 and r.read().startswith(b'OK'))
+                                if ok:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(2)
+                        if ok:
+                            print(f"✅ Túnel LocalTunnel ativo!")
+                            print(f"🌍 Link para fora da rede: {url_publica}")
+                            print(f"   Ver/copiar link: http://127.0.0.1:5000/link")
+                            def _fechar_lt():
+                                try:
+                                    if _pn.poll() is None:
+                                        _pn.terminate()
+                                        _pn.wait(timeout=5)
+                                except Exception:
+                                    pass
+                            atexit.register(_fechar_lt)
+                            _lh_url = _lt_url
+                        else:
+                            try:
+                                _pn.terminate()
+                                _pn.wait(timeout=2)
+                            except Exception:
+                                pass
+                    else:
+                        try:
+                            _pn.terminate()
+                            _pn.wait(timeout=2)
+                        except Exception:
+                            pass
+                        print("   LocalTunnel: falhou (instale Node.js para usar: https://nodejs.org).")
+                except FileNotFoundError:
+                    print("   LocalTunnel: npx não encontrado (instale Node.js).")
+                except Exception as _elt:
+                    print(f"   LocalTunnel: {_elt}")
+            # 4) Bore (bore.pub) — no Windows o .exe pode ser bloqueado pelo antivírus
+            if not _lh_url and os.name == 'nt':
+                print("🌐 A tentar túnel Bore (bore.pub)...")
+                _bore_url = None
+                _bore_exe = os.path.join(_base, 'bore.exe')
+                try:
+                    if not os.path.isfile(_bore_exe):
+                        try:
+                            req = urllib.request.Request('https://api.github.com/repos/ekzhang/bore/releases/latest', headers={'Accept': 'application/vnd.github.v3+json'})
+                            with urllib.request.urlopen(req, timeout=15, context=ssl.create_default_context()) as resp:
+                                data = json.loads(resp.read().decode())
+                            for asset in (data.get('assets') or []):
+                                name = (asset.get('name') or '').lower()
+                                if 'windows' in name and ('x86_64' in name or 'amd64' in name) and (name.endswith('.zip') or name.endswith('.exe')):
+                                    url_dl = asset.get('browser_download_url')
+                                    if url_dl:
+                                        with urllib.request.urlopen(url_dl, timeout=45, context=ssl.create_default_context()) as resp2:
+                                            buf = resp2.read()
+                                        if name.endswith('.exe'):
+                                            with open(_bore_exe, 'wb') as f:
+                                                f.write(buf)
+                                        else:
+                                            import zipfile
+                                            import io
+                                            with zipfile.ZipFile(io.BytesIO(buf), 'r') as z:
+                                                for info in z.infolist():
+                                                    if info.filename.endswith('.exe'):
+                                                        with open(_bore_exe, 'wb') as f:
+                                                            f.write(z.read(info.filename))
+                                                        break
+                                        print("   Bore: descarregado.")
+                                        break
+                        except Exception as e:
+                            print(f"   Bore: falha ao descarregar ({e}).")
+                    if os.path.isfile(_bore_exe):
+                        _pb = subprocess.Popen([_bore_exe, 'local', '5000', '--to', 'bore.pub'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=_base)
+                        for _ in range(20):
+                            time.sleep(1)
+                            if _pb.poll() is not None:
+                                break
+                            try:
+                                _ln = _pb.stdout.readline()
+                                if not _ln:
+                                    continue
+                                # bore pode imprimir "bore.pub:12345" ou "Listening on bore.pub:12345" ou só a porta
+                                _mm = re.search(r'bore\.pub:(\d+)', _ln)
+                                if _mm:
+                                    _bore_url = 'http://bore.pub:' + _mm.group(1)
+                                    break
+                                _mm2 = re.search(r'(?:porta?|port)\s*[:\s]*(\d{4,5})', _ln, re.I)
+                                if _mm2:
+                                    _bore_url = 'http://bore.pub:' + _mm2.group(1)
+                                    break
+                            except Exception:
+                                pass
+                        if _bore_url:
+                            url_publica = _bore_url
+                            app.config['URL_PUBLICA'] = url_publica
+                            ok = False
+                            for _ in range(5):
+                                try:
+                                    req = urllib.request.Request(_bore_url + '/tunnel-ok', headers={'User-Agent': 'Mozilla/5.0'})
+                                    with urllib.request.urlopen(req, timeout=8) as r:
+                                        ok = (r.status == 200 and r.read().startswith(b'OK'))
+                                    if ok:
+                                        break
+                                except Exception:
+                                    pass
+                                time.sleep(2)
+                            if ok:
+                                print(f"✅ Túnel Bore ativo!")
+                                print(f"🌍 Link para fora da rede: {url_publica}")
+                                print(f"   Ver/copiar link: http://127.0.0.1:5000/link")
+                                def _fechar_bore():
+                                    try:
+                                        if _pb.poll() is None:
+                                            _pb.terminate()
+                                            _pb.wait(timeout=5)
+                                    except Exception:
+                                        pass
+                                atexit.register(_fechar_bore)
+                                _lh_url = _bore_url
+                            else:
+                                try:
+                                    _pb.terminate()
+                                    _pb.wait(timeout=2)
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                _pb.terminate()
+                                _pb.wait(timeout=2)
+                            except Exception:
+                                pass
+                            print("   Bore: não obteve URL (bore.pub pode estar bloqueado ou timeout).")
+                    else:
+                        print("   Bore: bore.exe em falta (descarregue de https://github.com/ekzhang/bore/releases).")
+                except Exception as _eb:
+                    print(f"   Bore: erro ({_eb}).")
+            if not _lh_url:
+                # 5) Último recurso: Cloudflare Tunnel (trycloudflare costuma dar 404 nesta rede)
+                cloudflared_exe = os.path.join(_base, 'cloudflared.exe')
+                cloudflared_path = None
+                for path in ['cloudflared', 'cloudflared.exe', cloudflared_exe]:
+                    try:
+                        r = subprocess.run([path, 'version'], capture_output=True, timeout=5)
+                        if r.returncode == 0:
+                            cloudflared_path = path
+                            break
+                    except Exception:
+                        pass
+                if not cloudflared_path and os.name == 'nt':
+                    try:
+                        ctx = ssl.create_default_context()
+                        req = urllib.request.Request('https://api.github.com/repos/cloudflare/cloudflared/releases/latest', headers={'Accept': 'application/vnd.github.v3+json'})
+                        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                            data = json.loads(resp.read().decode())
+                        for asset in data.get('assets', []):
+                            name = (asset.get('name') or '').lower()
+                            if 'windows' in name and 'amd64' in name and (name.endswith('.exe') or 'exe' in name):
+                                with urllib.request.urlopen(asset.get('browser_download_url'), timeout=60, context=ctx) as resp2:
+                                    with open(cloudflared_exe, 'wb') as f:
+                                        f.write(resp2.read())
+                                cloudflared_path = cloudflared_exe
+                                break
+                    except Exception:
+                        pass
+                if not cloudflared_path:
+                    return
+                import tempfile
+                _cf_config_dir = tempfile.mkdtemp(prefix='cf_tunnel_')
+                _cf_env = os.environ.copy()
+                _cf_env['CLOUDFLARED_CONFIG_DIR'] = _cf_config_dir
+                print("🌐 A iniciar Cloudflare Tunnel (trycloudflare.com)...")
+                print("   Se o link der 404 ao abrir: ative OpenSSH no Windows (Definições > Aplicações > Funcionalidades opcionais > Cliente OpenSSH) e reinicie a app (usará localhost.run ou serveo).")
+                cf_process = subprocess.Popen(
                 [cloudflared_path, 'tunnel', '--url', 'http://127.0.0.1:5000'],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=_cf_env, cwd=_cf_config_dir
             )
@@ -8888,14 +10755,15 @@ if __name__ == '__main__':
                     time.sleep(5)
                 if ok:
                     print(f"✅ Túnel Cloudflare ativo e a responder!")
-                    print(f"🌍 Abrir fora da rede (telemóvel/dados): {url_publica}")
-                    print(f"   Login: {url_publica}/  (teste: {url_publica}/tunnel-ok)")
+                    print(f"🌍 Link para fora da rede: {url_publica}")
+                    print(f"   Ver/copiar link (sem QR): http://127.0.0.1:5000/link")
+                    print(f"   Se ao abrir der 404, use no telemóvel em DADOS MÓVEIS (não Wi‑Fi da empresa).")
                 else:
                     # Cloudflare deu URL mas verificação falhou (rede pode bloquear trycloudflare.com). Tentar localhost.run (SSH).
                     print(f"⚠️  Túnel Cloudflare criado mas não respondeu (a rede pode bloquear trycloudflare.com). A tentar localhost.run...")
                     _lh_url = None
                     try:
-                        _ssh_cmd = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL' if os.name == 'nt' else 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=20', '-R', '80:localhost:5000', 'nokey@localhost.run']
+                        _ssh_cmd = [_ssh_exe, '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=NUL' if os.name == 'nt' else 'UserKnownHostsFile=/dev/null', '-o', 'ConnectTimeout=20', '-R', '80:localhost:5000', 'nokey@localhost.run']
                         _p = subprocess.Popen(_ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                         for _ in range(30):
                             time.sleep(1)
@@ -8978,11 +10846,12 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"   ⚠️  Túnel Cloudflare: {e}")
     
-    if url_publica is None:
+    # Túnel desativado: aplicação apenas na rede local ou via VPN.
+    if False:  # url_publica desativado
         threading.Thread(target=_iniciar_cloudflared_apos_servidor, daemon=True).start()
-        print("   💡 Túnel Cloudflare: aguarde ~15 s. Depois abra no browser  http://127.0.0.1:5000/qr  para ver o link e o QR code (telemóvel).")
+        print("   💡 Túnel: aguarde ~15 s. Depois abra  http://127.0.0.1:5000/link  para ver e copiar o link (fora da rede).")
     
-    if usar_cloudflare_automatico:
+    if False:  # cloudflare/ngrok desativados (rede local ou VPN apenas)
         try:
             import subprocess
             import json
@@ -9245,27 +11114,11 @@ if __name__ == '__main__':
         # Se url_publica é None, já foi mostrada a dica de instalar cloudflared no fallback
     
     print(f"Servidor iniciado em:")
-    print(f"  - Local: http://127.0.0.1:5000")
-    print(f"  - Rede Local: http://{ip_local}:5000")
+    print(f"  - Local: http://127.0.0.1:{SERVER_PORT}")
+    print(f"  - Rede (para a colega): http://{ip_local}:{SERVER_PORT}")
     if tailscale_ip:
-        print(f"  - Tailscale (outra rede): http://{tailscale_ip}:5000")
-    if url_publica:
-        print(f"  - Internet: {url_publica}")
+        print(f"  - VPN (Tailscale): http://{tailscale_ip}:{SERVER_PORT}  [opcional]")
     print(f"Banco de dados: {DATABASE}")
-    print("=" * 60)
-    print(f"Telemovel na MESMA Wi-Fi:  http://{ip_local}:5000")
-    if url_publica:
-        print(f"ABRIR FORA DA REDE (telemovel/dados):  {url_publica}")
-    elif tailscale_ip:
-        print(f"Telemovel noutra rede:  http://{tailscale_ip}:5000  (Tailscale)")
-    else:
-        print("Fora da rede: aguarde a URL do túnel (Cloudflare) acima em ~15 s, ou use Tailscale.")
-    if not url_publica:
-        print("")
-        print(">>> ABRIR NO TELEMOVEL (facil, sem instalar nada):")
-        print("    No telemovel: desligue o Wi-Fi e use DADOS MOVEIS. Depois abra no browser")
-        print("    a URL Cloudflare que apareceu acima (ou em  http://127.0.0.1:5000/acesso-remoto ).")
-        print("")
     print("=" * 60)
     
     # Abrir navegador automaticamente após 2 segundos
@@ -9280,7 +11133,7 @@ if __name__ == '__main__':
         time.sleep(2)  # Aguardar servidor iniciar
         if not navegador_aberto['aberto']:
             navegador_aberto['aberto'] = True
-            webbrowser.open('http://127.0.0.1:5000')
+            webbrowser.open(f'http://127.0.0.1:{SERVER_PORT}')
     
     threading.Thread(target=abrir_navegador, daemon=True).start()
     
@@ -9305,6 +11158,19 @@ if __name__ == '__main__':
     # Handler de erros global para garantir que sempre retorna JSON
     @app.errorhandler(404)
     def not_found(error):
+        # Browser: página com links para login e acesso (rede/VPN)
+        accept = request.headers.get('Accept', '') or ''
+        if 'text/html' in accept and not request.path.startswith('/api/'):
+            from flask import render_template_string
+            html = '''<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Página não encontrada</title>
+            <style>body{font-family:sans-serif;max-width:420px;margin:2rem auto;padding:1rem;text-align:center;}
+            h1{font-size:1.25rem;} a{color:#0d6efd;} .links{margin-top:1.5rem;}</style></head><body>
+            <h1>Página não encontrada</h1>
+            <p>O endereço que pediu não existe.</p>
+            <div class="links"><a href="/login">Ir para login</a> &nbsp;|&nbsp; <a href="/link">Acesso (rede/VPN)</a></div>
+            </body></html>'''
+            return render_template_string(html), 404
         return jsonify({'error': 'Endpoint não encontrado'}), 404
 
     @app.errorhandler(500)
@@ -9321,7 +11187,7 @@ if __name__ == '__main__':
         print(traceback.format_exc())
         return jsonify({'error': f'Erro: {str(e)}'}), 500
     
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=SERVER_PORT, debug=False, use_reloader=False)
 
 
 

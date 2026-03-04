@@ -1,0 +1,11 @@
+# Render Blueprint - deploy gratuito
+# Em render.com: New > Blueprint e ligar este repositório, ou criar Web Service manualmente
+services:
+  - type: web
+    name: planeamento-cargas
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
